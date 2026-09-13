@@ -48,12 +48,17 @@ from scipy.optimize import minimize
 
 __all__ = [
     "DPM", "MODELS", "Model", "FitResult", "EurResult", "Series",
+    "UnitSystem", "UNITS", "FIELD", "METRIC", "units",
+    "M3_TO_BBL", "E3M3_TO_MCF", "KPA_TO_PSI", "M_TO_FT", "HA_TO_ACRE",
     "nom_from_eff", "eff_from_nom",
     "fit", "fit_from", "eur", "cumulative", "aicc",
     "bootstrap_eur", "percentile",
     "loss_ratio_b", "loglog_slope", "find_plateau", "extrapolation_multiple",
     "wor_analysis", "chan_derivative",
     "z_factor", "material_balance", "fetkovich_fit",
+    "volumetric_oil_in_place", "volumetric_gas_in_place", "gas_fvf", "oil_fvf",
+    "standing_rs", "standing_bo", "oil_material_balance", "OilMBResult",
+    "movable_volume_from_decline", "MovableVolume", "WellVolumes",
     "load_csv", "load_pressure_csv", "read_table", "load_frame",
     "find_date_column", "find_days_column", "find_production_columns",
 ]
@@ -79,6 +84,95 @@ def nom_from_eff(d_eff: float) -> float:
 def eff_from_nom(d_nom: float) -> float:
     """Nominal decline -> effective decline over the same period."""
     return 1.0 - math.exp(-d_nom)
+
+
+# ----------------------------------------------------------------------------
+# unit systems
+# ----------------------------------------------------------------------------
+#
+# Every calculation in this module is in FIELD units, and stays there. That is
+# not a preference -- it is what the correlations are fitted in. Dranchuk-
+# Abou-Kassem takes psia and Rankine, Standing takes psia and API, the
+# volumetric constants 7758 and 43560 are acre-feet conversions. Converting
+# those to SI internally would mean re-deriving each constant and getting one
+# of them wrong.
+#
+# So metric is handled at the EDGES: input is converted to field on the way in,
+# results converted back on the way out, and there is exactly one conversion
+# point in each direction. A round-trip test asserts that the same well loaded
+# as field and as metric gives the same answer.
+
+@dataclass(frozen=True)
+class UnitSystem:
+    """Labels and conversion factors for one unit system.
+
+    Every factor converts FROM this system TO field units, which is the
+    direction the library needs. Divide to go the other way.
+    """
+    name: str
+    oil: str                # stock-tank liquid
+    gas: str
+    rate_suffix: str        # what to append for a daily rate
+    pressure: str
+    temperature: str
+    length: str
+    area: str
+    oil_to_bbl: float
+    gas_to_mcf: float
+    length_to_ft: float
+    area_to_acre: float
+
+    def volume_label(self, is_gas: bool) -> str:
+        return self.gas if is_gas else self.oil
+
+    def volume_to_field(self, v, is_gas: bool):
+        return v * (self.gas_to_mcf if is_gas else self.oil_to_bbl)
+
+    def volume_from_field(self, v, is_gas: bool):
+        return v / (self.gas_to_mcf if is_gas else self.oil_to_bbl)
+
+    def pressure_to_psia(self, p):
+        return p * (1.0 if self.name == "field" else KPA_TO_PSI)
+
+    def pressure_from_psia(self, p):
+        return p / (1.0 if self.name == "field" else KPA_TO_PSI)
+
+    def temperature_to_degf(self, t):
+        return t if self.name == "field" else t * 9.0 / 5.0 + 32.0
+
+    def temperature_from_degf(self, t):
+        return t if self.name == "field" else (t - 32.0) * 5.0 / 9.0
+
+
+# Exact by definition where one exists; otherwise the standard value.
+M3_TO_BBL = 6.2898107704                 # 1 m3 = 6.2898... bbl (from 1 bbl = 158.987294928 L)
+E3M3_TO_MCF = 35.3146667215              # 1 thousand m3 = 35.31 Mcf (1 m3 = 35.3147 ft3)
+KPA_TO_PSI = 0.1450377377                # 1 kPa = 0.145 psi
+M_TO_FT = 3.280839895                    # exact: 1 ft = 0.3048 m
+HA_TO_ACRE = 2.4710538147                # 1 ha = 2.471 acres
+
+FIELD = UnitSystem(
+    name="field", oil="bbl", gas="Mcf", rate_suffix="/d",
+    pressure="psia", temperature="°F", length="ft", area="acres",
+    oil_to_bbl=1.0, gas_to_mcf=1.0, length_to_ft=1.0, area_to_acre=1.0,
+)
+
+METRIC = UnitSystem(
+    name="metric", oil="m³", gas="10³m³", rate_suffix="/d",
+    pressure="kPa", temperature="°C", length="m", area="ha",
+    oil_to_bbl=M3_TO_BBL, gas_to_mcf=E3M3_TO_MCF,
+    length_to_ft=M_TO_FT, area_to_acre=HA_TO_ACRE,
+)
+
+UNITS: Dict[str, UnitSystem] = {"field": FIELD, "metric": METRIC}
+
+
+def units(name: str) -> UnitSystem:
+    """Look up a unit system by name, case-insensitively."""
+    key = str(name).strip().lower()
+    if key not in UNITS:
+        raise ValueError(f"unknown unit system {name!r}; have {sorted(UNITS)}")
+    return UNITS[key]
 
 
 # ----------------------------------------------------------------------------
@@ -1169,12 +1263,373 @@ def fetkovich_fit(P, G, W, t_degf: float, sg: float, p_i: float,
 
 
 # ----------------------------------------------------------------------------
+# well-level volumes in place
+# ----------------------------------------------------------------------------
+#
+# Everything below is for ONE WELL: the volume that well is connected to and
+# can drain, not the reservoir's total. That distinction is the whole point.
+#
+#   Reservoir OGIP  what the tank holds, across every well in it
+#   Well GIIP       what THIS well's drainage volume holds
+#
+# A well-level number is what a single-well forecast can legitimately be
+# checked against. A reservoir number cannot: summing well forecasts against
+# it is only valid under volumetric depletion, and under a shared aquifer it
+# fails badly -- one string in the sample water-drive reservoir forecasts
+# 145.7 Bcf remaining on its own history where the whole reservoir allows
+# about 8-52 Bcf.
+#
+# Three routes here, in decreasing order of how much data they need:
+#
+#   1. volumetric      area, net pay, porosity, Sw, and an FVF -- the classic
+#                      estimate, and the only one that works before the well
+#                      has produced anything
+#   2. material balance well-level static pressures against that well's own
+#                      cumulative -- gives the CONNECTED volume, which is what
+#                      the well has actually shown it can reach
+#   3. from the decline  no pressure data at all: the q-vs-cumulative intercept
+#                      is the movable volume the well is draining
+#
+# They answer slightly different questions and are worth running together. A
+# volumetric number much larger than the connected one means the well is not
+# reaching all the rock that is mapped to it.
+
+BBL_PER_ACRE_FT = 7758.04          # bbl in an acre-foot
+CF_PER_ACRE_FT = 43560.0           # cubic feet in an acre-foot
+
+
+def gas_fvf(p_psia: float, t_degf: float, sg: float) -> float:
+    """Bg in ft3/scf."""
+    return 0.02827 * z_factor(p_psia, t_degf, sg) * (t_degf + 459.67) / p_psia
+
+
+def volumetric_gas_in_place(area_acres: float, net_pay_ft: float, porosity: float,
+                            sw: float, p_psia: float, t_degf: float,
+                            sg: float = 0.65) -> float:
+    """Well GIIP in scf, from the rock.
+
+        GIIP = 43560 * A * h * phi * (1 - Sw) / Bgi
+
+    `area_acres` is this well's DRAINAGE area, not the field's. For a vertical
+    well that is roughly the spacing unit; for a horizontal well, the stimulated
+    length times the effective half-width times two.
+    """
+    for name, v in (("porosity", porosity), ("water saturation", sw)):
+        if not 0 <= v < 1:
+            raise ValueError(f"{name} must be a fraction between 0 and 1, got {v}")
+    if min(area_acres, net_pay_ft, p_psia) <= 0:
+        raise ValueError("area, net pay and pressure must all be positive")
+    return (CF_PER_ACRE_FT * area_acres * net_pay_ft * porosity * (1.0 - sw)
+            / gas_fvf(p_psia, t_degf, sg))
+
+
+def volumetric_oil_in_place(area_acres: float, net_pay_ft: float, porosity: float,
+                            sw: float, boi: float = 1.2) -> float:
+    """Well STOIIP in stock-tank barrels, from the rock.
+
+        STOIIP = 7758 * A * h * phi * (1 - Sw) / Boi
+    """
+    for name, v in (("porosity", porosity), ("water saturation", sw)):
+        if not 0 <= v < 1:
+            raise ValueError(f"{name} must be a fraction between 0 and 1, got {v}")
+    if min(area_acres, net_pay_ft, boi) <= 0:
+        raise ValueError("area, net pay and Boi must all be positive")
+    return BBL_PER_ACRE_FT * area_acres * net_pay_ft * porosity * (1.0 - sw) / boi
+
+
+# --- black-oil PVT, so an oil material balance needs only field data ---------
+
+def standing_rs(p_psia: float, t_degf: float, api: float, sg_gas: float) -> float:
+    """Solution GOR in scf/STB (Standing, 1947)."""
+    if p_psia <= 0:
+        return 0.0
+    x = 0.0125 * api - 0.00091 * t_degf
+    return sg_gas * ((p_psia / 18.2 + 1.4) * 10.0 ** x) ** 1.2048
+
+
+def standing_bo(rs: float, t_degf: float, api: float, sg_gas: float) -> float:
+    """Oil formation volume factor at or below the bubble point, rb/STB."""
+    sg_oil = 141.5 / (131.5 + api)
+    f = rs * math.sqrt(sg_gas / sg_oil) + 1.25 * t_degf
+    return 0.9759 + 0.00012 * f ** 1.2
+
+
+def oil_fvf(p_psia: float, pb_psia: float, t_degf: float, api: float,
+            sg_gas: float, co: float = 1.0e-5) -> tuple:
+    """(Bo, Rs) at pressure p, either side of the bubble point.
+
+    Above Pb the oil is undersaturated: Rs is fixed at Rsb and Bo shrinks with
+    pressure through the oil compressibility. Below it, gas comes out of
+    solution and both fall.
+    """
+    rsb = standing_rs(pb_psia, t_degf, api, sg_gas)
+    if p_psia >= pb_psia:
+        bob = standing_bo(rsb, t_degf, api, sg_gas)
+        return bob * math.exp(co * (pb_psia - p_psia)), rsb
+    rs = standing_rs(p_psia, t_degf, api, sg_gas)
+    return standing_bo(rs, t_degf, api, sg_gas), rs
+
+
+@dataclass
+class OilMBResult:
+    """Havlena-Odeh oil material balance for a single well's drainage volume."""
+    stoiip: float                   # STB
+    r2: float
+    points: pd.DataFrame            # per-survey F, Eo, Efw, F/Et
+    np_now: float                   # STB produced
+    depletion_drive_pct: float      # share of withdrawal met by oil+rock expansion
+    water_drive_pct: float
+    saturated: bool
+    rising_f_over_et: float         # last / first -- >1.25 means outside energy
+
+    @property
+    def drive(self) -> str:
+        if self.water_drive_pct > 25:
+            return "water drive or pressure support"
+        return "depletion drive"
+
+    def __repr__(self):
+        return (f"<OilMBResult STOIIP={self.stoiip:,.0f} STB "
+                f"drive={self.drive!r} R2={self.r2:.4f}>")
+
+
+def oil_material_balance(pressure_psia, np_stb, t_degf: float, api: float,
+                         sg_gas: float, pb_psia: float,
+                         rp_scf_per_stb=None, wp_stb=None,
+                         cw: float = 3.0e-6, cf: float = 4.0e-6,
+                         sw: float = 0.25, co: float = 1.0e-5,
+                         gas_cap_m: float = 0.0) -> OilMBResult:
+    """Well STOIIP from pressure against this well's own cumulative oil.
+
+    Havlena-Odeh as a straight line: F = N * Et + We, with
+
+        F   = Np*[Bo + (Rp - Rs)*Bg] + Wp*Bw        net withdrawal, rb
+        Eo  = (Bo - Boi) + (Rsi - Rs)*Bg            oil and dissolved gas
+        Eg  = Boi * (Bg/Bgi - 1)                    gas cap, if m > 0
+        Efw = (1+m)*Boi*(cw*Sw + cf)/(1-Sw)*dp      rock and connate water
+        Et  = Eo + m*Eg + Efw
+
+    N is the slope of F against Et. Above the bubble point Eo collapses to
+    (Bo - Boi) and Efw usually dominates -- an undersaturated oil reservoir
+    produces by rock and water expansion, which is why its STOIIP estimate is
+    so sensitive to cf and why a small pressure drop implies a large N.
+
+    F/Et rising with cumulative is the same water-influx signature as F/Eg in
+    the gas case: something outside the oil is supplying energy.
+
+    PVT comes from Standing's correlations, so the inputs are things a field
+    actually has -- API, gas gravity, temperature, bubble point -- rather than
+    a lab report. Supply `rp_scf_per_stb` (cumulative produced GOR) when the
+    well is below the bubble point; without it, Rp is taken as Rsi, which is
+    correct only above it.
+    """
+    P = _arr(pressure_psia)
+    Np = _arr(np_stb)
+    if P.size != Np.size:
+        raise ValueError("pressure and cumulative oil must be the same length")
+    if P.size < 3:
+        raise ValueError("need at least 3 pressure surveys")
+
+    order = np.argsort(Np)
+    P, Np = P[order], Np[order]
+    Rp = _arr(rp_scf_per_stb)[order] if rp_scf_per_stb is not None else None
+    Wp = _arr(wp_stb)[order] if wp_stb is not None else np.zeros_like(P)
+
+    i_ref = int(np.argmax(P))
+    p_i = float(P[i_ref])
+    boi, rsi = oil_fvf(p_i, pb_psia, t_degf, api, sg_gas, co)
+    bgi = gas_fvf(p_i, t_degf, sg_gas) / 5.615          # rb/scf
+    saturated = bool(np.any(P < pb_psia))
+
+    rows = []
+    for k in range(P.size):
+        p = float(P[k])
+        if p >= p_i - 1e-9 or Np[k] <= 0:
+            continue
+        bo, rs = oil_fvf(p, pb_psia, t_degf, api, sg_gas, co)
+        bg = gas_fvf(p, t_degf, sg_gas) / 5.615         # rb/scf
+        rp = float(Rp[k]) if Rp is not None else rsi
+
+        F = Np[k] * (bo + max(rp - rs, 0.0) * bg) + Wp[k] * 1.0
+        Eo = (bo - boi) + max(rsi - rs, 0.0) * bg
+        Eg = boi * (bg / bgi - 1.0) if gas_cap_m > 0 else 0.0
+        Efw = (1.0 + gas_cap_m) * boi * (cw * sw + cf) / (1.0 - sw) * (p_i - p)
+        Et = Eo + gas_cap_m * Eg + Efw
+        if Et <= 0 or F <= 0:
+            continue
+        rows.append({"P": p, "Np": float(Np[k]), "Bo": bo, "Rs": rs, "Bg": bg,
+                     "F": F, "Eo": Eo, "Efw": Efw, "Et": Et, "F_over_Et": F / Et,
+                     "depletion_frac": (Eo + gas_cap_m * Eg) / Et})
+    if len(rows) < 2:
+        raise ValueError(
+            "not enough usable surveys -- every point must be below the reference "
+            "pressure with positive cumulative oil")
+    pts = pd.DataFrame(rows)
+
+    # N is the slope of F vs Et through the origin, which is the form the
+    # straight-line method assumes (no free term: at Et = 0 nothing has been
+    # withdrawn). Least squares through zero.
+    N = float(np.sum(pts["F"] * pts["Et"]) / np.sum(pts["Et"] ** 2))
+    resid = pts["F"] - N * pts["Et"]
+    ss, st = float(np.sum(resid ** 2)), float(np.sum((pts["F"] - pts["F"].mean()) ** 2))
+    r2 = (1.0 - ss / st) if st > 0 else 0.0
+
+    rise = float(pts["F_over_Et"].iloc[-1] / pts["F_over_Et"].iloc[0])
+    dep = float(pts["depletion_frac"].iloc[-1]) * 100.0
+
+    return OilMBResult(
+        stoiip=N, r2=r2, points=pts, np_now=float(Np[-1]),
+        depletion_drive_pct=min(dep, 100.0),
+        water_drive_pct=max(0.0, 100.0 * (1.0 - 1.0 / max(rise, 1e-9))),
+        saturated=saturated, rising_f_over_et=rise,
+    )
+
+
+# --- the route that needs no pressure data at all ---------------------------
+
+@dataclass
+class MovableVolume:
+    """Contacted movable volume from the rate-cumulative trend."""
+    movable: float                  # volume at q -> 0, in the production unit
+    already: float                  # cumulative at the last point used
+    r2: float
+    n: int
+
+    @property
+    def remaining_movable(self) -> float:
+        return max(self.movable - self.already, 0.0)
+
+
+def movable_volume_from_decline(cum, q, tail: float = 0.6) -> Optional[MovableVolume]:
+    """Extrapolate q against cumulative to q = 0.
+
+    Under boundary-dominated flow at roughly constant bottomhole pressure, rate
+    falls linearly with cumulative, and the x-intercept is the volume the well
+    is connected to and can move -- its drainage volume, expressed as fluid
+    rather than as rock.
+
+    This needs no pressure data, which is what makes it worth having: most
+    wells have a production history and no surveys. But read the R2. A well
+    still in transient flow, or one whose drawdown keeps changing, has no
+    straight line here, and an extrapolated intercept from a curve is a number
+    with no meaning.
+
+    The intercept is RECOVERABLE to zero rate, not in place. Divide by a
+    recovery factor to get in place -- and note that "zero rate" is not the
+    same as "zero pressure", so this is closer to a movable volume than to a
+    true ultimate.
+    """
+    cum, q = _arr(cum), _arr(q)
+    ok = np.isfinite(cum) & np.isfinite(q) & (q > 0)
+    if ok.sum() < 6:
+        return None
+    cum, q = cum[ok], q[ok]
+    cut = cum[int(cum.size * (1.0 - tail))]     # the late, boundary-dominated part
+    sel = cum >= cut
+    if sel.sum() < 4:
+        sel = np.ones(cum.size, dtype=bool)
+
+    m, b = np.polyfit(cum[sel], q[sel], 1)
+    if m >= 0:
+        return None                              # rate rising with cumulative
+    yh = m * cum[sel] + b
+    ss = float(np.sum((q[sel] - yh) ** 2))
+    st = float(np.sum((q[sel] - q[sel].mean()) ** 2))
+    return MovableVolume(movable=float(-b / m), already=float(cum[-1]),
+                         r2=(1.0 - ss / st) if st > 0 else 0.0, n=int(sel.sum()))
+
+
+# --- putting the four numbers side by side ----------------------------------
+
+@dataclass
+class WellVolumes:
+    """In place, produced, forecast and remaining -- for one well, reconciled."""
+    in_place: Optional[float]
+    cum: float
+    eur: float
+    unit: str = "bbl"
+    max_rf_pct: float = 100.0
+    source: str = ""
+
+    @property
+    def remaining(self) -> float:
+        return max(self.eur - self.cum, 0.0)
+
+    @property
+    def rf_to_date_pct(self) -> Optional[float]:
+        return 100.0 * self.cum / self.in_place if self.in_place else None
+
+    @property
+    def rf_ultimate_pct(self) -> Optional[float]:
+        return 100.0 * self.eur / self.in_place if self.in_place else None
+
+    @property
+    def recoverable_at_max_rf(self) -> Optional[float]:
+        return self.in_place * self.max_rf_pct / 100.0 if self.in_place else None
+
+    @property
+    def capped_remaining(self) -> Optional[float]:
+        cap = self.recoverable_at_max_rf
+        return None if cap is None else max(cap - self.cum, 0.0)
+
+    @property
+    def verdict(self) -> str:
+        """What the implied recovery factor says about the forecast.
+
+        This is the check the whole thing exists for. A decline curve has no
+        idea how much fluid is in the ground; if its EUR implies a recovery
+        factor the rock cannot deliver, the forecast is wrong and no amount of
+        R2 will say so.
+        """
+        rf = self.rf_ultimate_pct
+        if rf is None:
+            return "no in-place volume set -- the forecast is unconstrained"
+
+        # Order matters. What has ALREADY been produced is measured, not forecast,
+        # so if it breaches the ceiling the in-place volume is what is wrong --
+        # and saying "the EUR is too high" there would send someone to fix the
+        # one number in the comparison that is not in doubt.
+        if self.rf_to_date_pct and self.rf_to_date_pct > self.max_rf_pct:
+            return (f"{self.rf_to_date_pct:.0f}% has already been produced, above the "
+                    f"{self.max_rf_pct:.0f}% ceiling -- the in-place volume is too small")
+        if rf > self.max_rf_pct:
+            return (f"the forecast implies {rf:.0f}% recovery, above the {self.max_rf_pct:.0f}% "
+                    "ceiling -- the EUR is too high for the volume in place")
+        if rf > 0.9 * self.max_rf_pct:
+            return f"the forecast implies {rf:.0f}% recovery, close to the ceiling"
+        return f"the forecast implies {rf:.0f}% recovery, within the ceiling"
+
+    def as_frame(self) -> pd.DataFrame:
+        rows = [("In place", self.in_place, self.source or "—")]
+        rows += [
+            ("Cumulative to date", self.cum,
+             f"{self.rf_to_date_pct:.1f}% recovered" if self.rf_to_date_pct else "—"),
+            ("EUR (decline forecast)", self.eur,
+             f"{self.rf_ultimate_pct:.1f}% ultimate recovery" if self.rf_ultimate_pct else "—"),
+            ("Remaining reserves", self.remaining, "EUR less cumulative"),
+        ]
+        if self.in_place:
+            rows.append((f"Recoverable at {self.max_rf_pct:.0f}% RF",
+                         self.recoverable_at_max_rf, "in place x recovery factor"))
+            rows.append(("Remaining against that cap", self.capped_remaining,
+                         "cap less cumulative"))
+        return pd.DataFrame(rows, columns=["", f"Volume ({self.unit})", "Note"])
+
+
+# ----------------------------------------------------------------------------
 # data loading
 # ----------------------------------------------------------------------------
 
 @dataclass
 class Series:
-    """A production history on a month clock, ready to fit."""
+    """A production history on a month clock, ready to fit.
+
+    Volumes and rates here are ALWAYS in field units -- bbl for liquid, Mcf for
+    gas -- whatever the source was in. Metric input is converted on the way in
+    by load_frame's `volume_factor`, and converted back for display by
+    UnitSystem.volume_from_field. There is exactly one conversion in each
+    direction, and it is not here.
+    """
     t: np.ndarray                       # months since the first record, mid-period
     q: np.ndarray                       # operated-day rate
     volume: np.ndarray
@@ -1216,6 +1671,76 @@ class Series:
 _DELIMS = ["\t", ",", ";", "|"]
 
 
+# Excel files are binary, so they are detected before any text handling. The
+# magic bytes are checked as well as the extension: browsers and mail clients
+# rename things, and a .xlsx that has been saved as .csv is a common way to
+# arrive here.
+_XLSX_MAGIC = b"PK\x03\x04"                 # xlsx/xlsm are zip archives
+_XLS_MAGIC = b"\xd0\xcf\x11\xe0"           # xls is an OLE2 compound file
+
+
+def _peek(source) -> bytes:
+    if isinstance(source, bytes):
+        return source[:8]
+    if hasattr(source, "read"):
+        pos = source.tell() if hasattr(source, "tell") else None
+        head = source.read(8)
+        if pos is not None and hasattr(source, "seek"):
+            source.seek(pos)
+        return head if isinstance(head, bytes) else b""
+    if isinstance(source, str) and "\n" not in source and os.path.exists(source):
+        try:
+            with open(source, "rb") as fh:
+                return fh.read(8)
+        except OSError:
+            return b""
+    return b""
+
+
+def _is_excel(source) -> bool:
+    if isinstance(source, str) and "\n" not in source and \
+            source.lower().endswith((".xlsx", ".xlsm", ".xls")):
+        return True
+    head = _peek(source)
+    return head.startswith(_XLSX_MAGIC) or head.startswith(_XLS_MAGIC)
+
+
+def _read_excel(source) -> pd.DataFrame:
+    """First sheet, or the first sheet that actually holds a table.
+
+    A production export often has a cover sheet, or a title block above the
+    header row, so a sheet is skipped when nothing in its first rows parses as
+    a header over numbers.
+    """
+    buf = io.BytesIO(source) if isinstance(source, bytes) else source
+    head = _peek(buf)
+    engine = "xlrd" if head.startswith(_XLS_MAGIC) else "openpyxl"
+    try:
+        book = pd.read_excel(buf, sheet_name=None, engine=engine)
+    except ImportError as exc:                                   # noqa: BLE001
+        need = "xlrd" if engine == "xlrd" else "openpyxl"
+        raise ValueError(
+            f"reading this workbook needs the {need} package: pip install {need}") from exc
+    except Exception as exc:                                     # noqa: BLE001
+        raise ValueError(f"could not read that workbook: {exc}") from exc
+
+    best = None
+    for name, sheet in book.items():
+        sheet = sheet.dropna(how="all").dropna(axis=1, how="all")
+        if sheet.shape[1] < 2 or len(sheet) < 3:
+            continue
+        # Prefer a sheet where a date column is findable -- that is the data.
+        if find_date_column(sheet) is not None:
+            return sheet.reset_index(drop=True)
+        if best is None:
+            best = sheet
+    if best is None:
+        raise ValueError(
+            "no sheet in that workbook holds a table with at least two columns and "
+            "three rows")
+    return best.reset_index(drop=True)
+
+
 def read_table(source) -> pd.DataFrame:
     """Read a table from a path, a file-like object, or a block of PASTED text.
 
@@ -1236,6 +1761,8 @@ def read_table(source) -> pd.DataFrame:
     """
     if isinstance(source, pd.DataFrame):
         df = source.copy()
+    elif _is_excel(source):
+        df = _read_excel(source)
     else:
         text = None
         if isinstance(source, bytes):
@@ -1310,7 +1837,8 @@ def find_date_column(df: pd.DataFrame) -> Optional[str]:
         if any(w in str(c).lower() for w in ("date", "month", "period", "time")):
             return c
     for c in df.columns:                        # fall back to what actually parses
-        s = df[c].dropna().astype(str).head(12)
+        s = df[c].dropna().astype(str).str.strip()
+        s = s[s.ne("")].head(12)
         if s.empty:
             continue
         try:
@@ -1322,6 +1850,37 @@ def find_date_column(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
+def _numeric(series) -> pd.Series:
+    """Coerce to numbers the way a human reads them.
+
+    Thousands separators, stray spaces and non-breaking spaces all survive a
+    copy-paste, and pd.to_numeric rejects every one of them. Column DETECTION
+    has to strip them too, not just the final read -- otherwise a column of
+    "1,234" looks non-numeric and the guesser skips past the production column
+    to whatever comes next.
+    """
+    return pd.to_numeric(
+        series.astype("string")
+              .str.replace(",", "", regex=False)
+              .str.replace("\u00a0", "", regex=False)
+              .str.replace(" ", "", regex=False)
+              .str.strip(),
+        errors="coerce")
+
+
+def _numeric_share(series) -> float:
+    """Fraction of the NON-BLANK cells that read as numbers.
+
+    Blanks are not evidence either way, and counting them as failures breaks a
+    pasted grid: ten real rows padded with six empty ones scores 0.625 and the
+    column stops looking numeric, so the guesser skips it.
+    """
+    filled = series.astype("string").fillna("").str.strip().ne("")
+    if filled.sum() < 3:
+        return 0.0
+    return float(_numeric(series)[filled].notna().mean())
+
+
 def find_production_columns(df: pd.DataFrame) -> List[str]:
     """Columns that plausibly hold oil or gas volumes, best guesses first."""
     named = [c for c in df.columns if str(c).lower().startswith(("oil", "gas"))]
@@ -1329,12 +1888,12 @@ def find_production_columns(df: pd.DataFrame) -> List[str]:
         return named
     date_c = find_date_column(df)
     numeric = [c for c in df.columns
-               if c != date_c and pd.to_numeric(df[c], errors="coerce").notna().mean() > 0.7]
+               if c != date_c and _numeric_share(df[c]) > 0.7]
 
     # A producing-days column is numeric too, and in an unnamed paste it is often
     # the first one. Values that all sit in 0-31.5 are days, not volumes.
     def _is_days(c):
-        v = pd.to_numeric(df[c], errors="coerce").dropna()
+        v = _numeric(df[c]).dropna()
         return not v.empty and float(v.max()) <= 31.5 and float(v.min()) >= 0
 
     return [c for c in numeric if not _is_days(c)] or numeric
@@ -1351,7 +1910,9 @@ def find_days_column(df: pd.DataFrame) -> Optional[str]:
         if "day" in str(c).lower() or str(c).strip().lower() in ("uptime", "dom", "pd"):
             return c
     for c in df.columns:                         # values that all sit inside a month
-        v = pd.to_numeric(df[c], errors="coerce").dropna()
+        if _numeric_share(df[c]) <= 0.7:
+            continue
+        v = _numeric(df[c]).dropna()
         if len(v) >= 5 and 0 < float(v.min()) and float(v.max()) <= 31.5 and v.mean() > 5:
             return c
     return None
@@ -1359,7 +1920,9 @@ def find_days_column(df: pd.DataFrame) -> Optional[str]:
 
 def load_frame(df: pd.DataFrame, column: Optional[str] = None,
                days_column: Optional[str] = "Days On",
-               date_column: Optional[str] = None, label: str = "data") -> Series:
+               date_column: Optional[str] = None, label: str = "data",
+               fluid: Optional[str] = None, volume_factor: float = 1.0,
+               water_factor: float = 1.0) -> Series:
     """Build a Series from an already-read table.
 
     Two things this does that a naive reader does not:
@@ -1388,14 +1951,12 @@ def load_frame(df: pd.DataFrame, column: Optional[str] = None,
         raise ValueError(f"no production column found in {label}: {list(df.columns)}")
 
     dates = pd.to_datetime(df[date_column], errors="coerce", format="mixed")
-    vol = pd.to_numeric(
-        df[column].astype(str).str.replace(",", "", regex=False).str.strip(),
-        errors="coerce")
+    vol = _numeric(df[column])
 
     if not days_column or days_column not in df.columns:
         days_column = find_days_column(df)
     if days_column and days_column in df.columns:
-        days = pd.to_numeric(df[days_column], errors="coerce")
+        days = _numeric(df[days_column])
     else:
         days = pd.Series(DPM, index=df.index)   # no uptime column: calendar days
 
@@ -1416,17 +1977,36 @@ def load_frame(df: pd.DataFrame, column: Optional[str] = None,
     water = None
     for c in df.columns:
         if str(c).lower().startswith("water"):
-            water = pd.to_numeric(df[c], errors="coerce").fillna(0.0).to_numpy()[order]
+            water = _numeric(df[c]).fillna(0.0).to_numpy()[order]
             break
+
+    # Fluid is declared, not guessed, when the caller says so. Guessing from the
+    # column name works for "Gas (Mcf)" and fails for "Sales volume".
+    if fluid is not None:
+        f = str(fluid).strip().lower()
+        if f not in ("oil", "gas"):
+            raise ValueError(f"fluid must be 'oil' or 'gas', got {fluid!r}")
+        is_gas = f == "gas"
+    else:
+        is_gas = "gas" in str(column).lower()
+
+    # volume_factor converts the incoming numbers into field units. It is the
+    # single conversion point on the way in; nothing downstream converts again.
+    if volume_factor != 1.0:
+        vol = vol * volume_factor
+    if water is not None and water_factor != 1.0:
+        water = water * water_factor
 
     return Series(t=t, q=vol / days, volume=vol, days=days, dates=dates,
                   cum=np.cumsum(vol), column=column,
-                  is_gas="gas" in str(column).lower(), water=water, frame=df)
+                  is_gas=is_gas, water=water, frame=df)
 
 
 def load_csv(path, column: Optional[str] = None,
              days_column: Optional[str] = "Days On",
-             date_column: Optional[str] = None) -> Series:
+             date_column: Optional[str] = None,
+             fluid: Optional[str] = None, volume_factor: float = 1.0,
+             water_factor: float = 1.0) -> Series:
     """Read a monthly production table into a Series.
 
         Date,Days On,Oil (bbl),Gas (Mcf),Water (bbl)
@@ -1437,7 +2017,8 @@ def load_csv(path, column: Optional[str] = None,
     """
     label = path if isinstance(path, str) and "\n" not in path else "the pasted data"
     return load_frame(read_table(path), column=column, days_column=days_column,
-                      date_column=date_column, label=str(label))
+                      date_column=date_column, label=str(label), fluid=fluid,
+                      volume_factor=volume_factor, water_factor=water_factor)
 
 
 def load_pressure_csv(source) -> pd.DataFrame:
@@ -1458,17 +2039,16 @@ def load_pressure_csv(source) -> pd.DataFrame:
     if len(cols) < 2:
         raise ValueError("need a pressure column and a cumulative gas column")
 
-    num = lambda c: pd.to_numeric(                                      # noqa: E731
-        df[c].astype(str).str.replace(",", "", regex=False).str.strip(), errors="coerce")
+    num = _numeric                                                      # noqa: E731
 
     out = pd.DataFrame({
         "date": (pd.to_datetime(df[date_c], errors="coerce", format="mixed")
                  if date_c is not None else pd.NaT),
-        "P": num(cols[0]),
-        "Gp": num(cols[1]),
+        "P": num(df[cols[0]]),
+        "Gp": num(df[cols[1]]),
     })
-    out["condensate"] = num(cols[2]).fillna(0.0) if len(cols) > 2 else 0.0
-    out["water"] = num(cols[3]).fillna(0.0) if len(cols) > 3 else 0.0
+    out["condensate"] = num(df[cols[2]]).fillna(0.0) if len(cols) > 2 else 0.0
+    out["water"] = num(df[cols[3]]).fillna(0.0) if len(cols) > 3 else 0.0
     out = out.dropna(subset=["P", "Gp"])
     if len(out) < 3:
         raise ValueError(f"only {len(out)} usable surveys -- need at least 3")

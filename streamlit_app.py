@@ -128,23 +128,31 @@ def _mb(P: tuple, Gp: tuple, cond: tuple, water: tuple, temp: float, sg: float,
 
 
 @st.cache_data(show_spinner=False)
-def _read_csv(src, name: str, column: str | None, days: str | None, date: str | None):
-    # src is a path, raw upload bytes, or pasted text -- read_table sorts out which.
+def _read_csv(src, name: str, column: str | None, days: str | None, date: str | None,
+              fluid: str, vfactor: float):
+    # src is a path, upload bytes (csv or a workbook), or pasted text -- read_table
+    # works out which. vfactor is the ONE place metric input becomes field units.
     src = io.BytesIO(src) if isinstance(src, bytes) else src
     return dca.load_frame(dca.read_table(src), column=column, days_column=days,
-                          date_column=date, label=name)
+                          date_column=date, label=name, fluid=fluid,
+                          volume_factor=vfactor, water_factor=vfactor)
 
 
 # Oilfield volume prefixes, which are not SI: for liquids M = thousand and
 # MM = million barrels; for gas the base unit is already Mcf, so a thousand of
 # them is MMcf and a million is Bcf.
 _SCALE = {
+    # field
     "bbl": [(1e9, "MMMbbl"), (1e6, "MMbbl"), (1e3, "Mbbl"), (1, "bbl")],
     "Mcf": [(1e9, "Tcf"), (1e6, "Bcf"), (1e3, "MMcf"), (1, "Mcf")],
+    # metric -- SI prefixes would read as 10^3 m3 = "dam3", which nobody writes
+    "m³": [(1e6, "10⁶m³"), (1e3, "10³m³"), (1, "m³")],
+    "10³m³": [(1e6, "10⁹m³"), (1e3, "10⁶m³"), (1, "10³m³")],
 }
 
 
 def fmt(v, unit="", dp=0):
+    """Scale a number into a readable oilfield prefix and label it."""
     if v is None or not math.isfinite(v):
         return "—"
     for div, label in _SCALE.get(unit, [(1, unit)]):
@@ -152,6 +160,36 @@ def fmt(v, unit="", dp=0):
             dp_ = dp if div == 1 else (2 if div > 1e3 else 1)
             return f"{v / div:,.{dp_}f} {label}".strip()
     return f"{v:,.{dp}f} {unit}".strip()
+
+
+def vol(v, dp=0):
+    """Format a FIELD-unit volume in the display system.
+
+    Every number that reaches the screen goes through here or through dsp().
+    Keeping the conversion in one pair of functions is what stops a metric
+    session from showing three numbers in field units and one in m3.
+    """
+    if v is None or not math.isfinite(v):
+        return "—"
+    return fmt(v / VFACTOR, VUNIT, dp)
+
+
+def liq(v, dp=0):
+    """Format a FIELD-unit LIQUID volume (bbl) in the display system.
+
+    Water and condensate are liquids even on a gas well, so they do not follow
+    the well's own volume unit.
+    """
+    if v is None or not math.isfinite(v):
+        return "—"
+    if U.name == "field":
+        return fmt(v, "bbl", dp)
+    return fmt(v / dca.M3_TO_BBL, "m³", dp)
+
+
+def dsp(x):
+    """Field-unit value or array -> display units."""
+    return np.asarray(x, dtype=float) / VFACTOR if np.ndim(x) else float(x) / VFACTOR
 
 
 def theme_axes(fig, xlab, ylab, ylog=False, xlog=False, height=460):
@@ -185,6 +223,99 @@ st.markdown(
 
 st.sidebar.title("Decline Curve Workbench")
 
+# --- what this is, before anything about how to read it --------------------
+st.sidebar.subheader("Well")
+wc1, wc2 = st.sidebar.columns(2)
+well_name = wc1.text_input("Well", value="", placeholder="e.g. A-26 LS",
+                           key="well_name")
+reservoir_name = wc2.text_input("Reservoir", value="", placeholder="e.g. D2300X",
+                                key="reservoir_name")
+
+fc1, fc2 = st.sidebar.columns(2)
+fluid = fc1.radio("Fluid", ["Oil", "Gas"], key="fluid", horizontal=True,
+                  help="Declared, not guessed from the column name. It sets the "
+                       "abandonment-rate default, which volume tab you get, and whether "
+                       "the water analysis is offered.")
+in_name = fc2.radio("Data is in", ["Field", "Metric"], key="unit_system",
+                    horizontal=True,
+                    help="What YOUR NUMBERS mean. Field: bbl, Mcf, psia, °F. "
+                         "Metric: m³, 10³m³, kPa, °C. Get this wrong and every volume "
+                         "is out by a factor of 6.3.")
+out_name = st.sidebar.radio("Show results in", ["Same as data", "Field", "Metric"],
+                            key="unit_out", horizontal=True,
+                            help="Reading and reporting are separate choices — field-unit "
+                                 "data reported in metric is a normal thing to want, and "
+                                 "one control doing both jobs would just relabel the "
+                                 "numbers without converting them.")
+unit_name = in_name if out_name == "Same as data" else out_name
+
+UIN = dca.units(in_name)                          # what the data means
+U = dca.units(unit_name)                          # what the screen shows
+IS_GAS = fluid == "Gas"
+VUNIT = U.volume_label(IS_GAS)                    # display label
+VIN = UIN.gas_to_mcf if IS_GAS else UIN.oil_to_bbl     # data -> field, on the way in
+VFACTOR = U.gas_to_mcf if IS_GAS else U.oil_to_bbl     # field -> display, on the way out
+
+label_bits = [b for b in (well_name.strip(), reservoir_name.strip()) if b]
+WELL_LABEL = " · ".join(label_bits) if label_bits else ""
+
+# --- keep entered values meaning what they meant when they were typed -------
+#
+# Switching units changes what a box MEANS, and Streamlit keeps whatever number
+# is in it. "10" typed as bbl/d silently becomes 10 m3/d, which is 63 bbl/d, and
+# the forecast moves without anything on screen saying why. So on a unit or
+# fluid change, every unit-bearing widget is converted through field units into
+# the new system.
+_UNIT_WIDGETS = {
+    "qab": "rate", "ip_direct": "volume",
+    "v_area": "area", "v_pay": "length", "v_pi": "pressure", "v_t": "temperature",
+    "mb_t": "temperature", "mb_pab": "pressure", "omb_t": "temperature",
+    "omb_pb": "pressure",
+}
+
+
+def _reunit(value: float, kind: str, old: "dca.UnitSystem", new: "dca.UnitSystem",
+            was_gas: bool, is_gas: bool) -> float:
+    if kind in ("rate", "volume"):
+        f_old = old.gas_to_mcf if was_gas else old.oil_to_bbl
+        f_new = new.gas_to_mcf if is_gas else new.oil_to_bbl
+        return value * f_old / f_new
+    if kind == "area":
+        return value * old.area_to_acre / new.area_to_acre
+    if kind == "length":
+        return value * old.length_to_ft / new.length_to_ft
+    if kind == "pressure":
+        return new.pressure_from_psia(old.pressure_to_psia(value))
+    if kind == "temperature":
+        return new.temperature_from_degf(old.temperature_to_degf(value))
+    return value
+
+
+def unum(container, label, key, default, **kw):
+    """A number_input whose default is seeded into session state once.
+
+    Passing both `value=` and writing the key from session state makes Streamlit
+    warn, and these boxes must be writable from session state -- that is how a
+    unit change rewrites them.
+    """
+    if key not in st.session_state:
+        st.session_state[key] = float(default)
+    return container.number_input(label, key=key, **kw)
+
+
+_sig = (unit_name, IS_GAS)
+_prev = st.session_state.get("_unit_sig")
+if _prev is not None and _prev != _sig:
+    _old_u, _old_gas = dca.units(_prev[0]), _prev[1]
+    for _k, _kind in _UNIT_WIDGETS.items():
+        if _k in st.session_state and isinstance(st.session_state[_k], (int, float)):
+            st.session_state[_k] = float(
+                _reunit(float(st.session_state[_k]), _kind, _old_u, U, _old_gas, IS_GAS))
+st.session_state["_unit_sig"] = _sig
+
+st.sidebar.divider()
+
+
 samples = sorted(p for p in glob.glob(os.path.join(DATA_DIR, "*.csv"))
                  if "pressure" not in os.path.basename(p))
 sample_names = [os.path.basename(p) for p in samples]
@@ -208,24 +339,96 @@ PASTE_HELP = (
 
 raw = None
 if source == "Paste":
-    txt = st.sidebar.text_area(
-        "Paste monthly production", height=200, key="paste",
-        placeholder="Date\tDays On\tOil (bbl)\tWater (bbl)\n"
-                    "2018-06-01\t30\t4874\t5288\n"
-                    "2018-07-01\t31\t9896\t3991\n"
-                    "2018-08-01\t31\t9143\t2536",
-        help="Tab, comma or semicolon separated. Header row optional.")
-    if not (txt or "").strip():
-        st.markdown("### Paste your production history")
-        st.markdown(PASTE_HELP)
-        with st.expander("What the columns mean, and why"):
-            st.markdown(COLUMN_NOTES)
+    # A grid, not a text box. The data starts in a spreadsheet, and a spreadsheet
+    # range pasted into a grid lands in cells; pasted into a text box it lands as
+    # tab-separated text that then has to be re-parsed. Both work here -- the text
+    # route is kept below for browsers whose clipboard does not cooperate with the
+    # grid -- but the grid is what the data already looks like.
+    # Column names stay constant whatever the fluid or units are, so switching
+    # either does not rebuild the grid and lose what has been pasted into it. The
+    # units live in the caption and the column help instead.
+    VCOL, WCOL = "Production", "Water"
+    BLANK_ROWS = 14
+    # Every column is text. Two reasons: this Streamlit renders an empty NUMERIC
+    # cell as a greyed literal "None", which looks like data; and a text column
+    # accepts whatever the clipboard holds -- "1,234", "1 234", a date in any
+    # format -- which dca's parser then coerces with the same code that handles
+    # pasted text and uploaded files. The grid is the entry surface; the parser
+    # is the validator.
+    template = pd.DataFrame({c: pd.Series([""] * BLANK_ROWS, dtype="string")
+                             for c in ("Date", "Days on", VCOL, WCOL)})
+
+    st.markdown("### Paste your production history")
+    st.caption(
+        "Click the first cell and paste — a whole range at once is fine. Rows are added "
+        "as you need them, and anything can be corrected in place afterwards. Only the "
+        "date and the production volume are required; leave a column blank if you do "
+        "not have it.")
+    st.markdown(
+        f"**{fluid.lower()} in {VUNIT} · water in {UIN.oil} · monthly volumes, not rates**"
+        + ("" if UIN.name == "field" else "  — reading as metric, per the sidebar"))
+
+    grid = st.data_editor(
+        template, key="paste_grid", num_rows="dynamic", width="stretch", height=460,
+        column_config={
+            "Date": st.column_config.TextColumn(
+                "Date", help="Any recognisable format: 2018-06-01, 06/01/2018, "
+                             "1-Jun-2018, Jun 2018.", width="medium"),
+            "Days on": st.column_config.TextColumn(
+                "Days on", help="Days the well actually flowed that month. Without it "
+                                "rates are calendar-day and downtime reads as decline."),
+            VCOL: st.column_config.TextColumn(
+                VCOL, help=f"Period volume of {fluid.lower()} in {VUNIT} — a volume, "
+                           "not a rate."),
+            WCOL: st.column_config.TextColumn(
+                WCOL, help=f"Produced water in {UIN.oil}. Optional; it unlocks the "
+                           "Water tab."),
+        })
+
+    def _has(col):
+        return grid[col].astype("string").fillna("").str.strip().ne("")
+
+    filled = grid[_has("Date") & _has(VCOL)]
+
+    tc1, tc2 = st.columns([3, 1])
+    tc1.caption(f"**{len(filled)}** row{'' if len(filled) == 1 else 's'} with a date and a "
+                "volume. Five is the minimum to fit.")
+    if tc2.button("Clear the table", use_container_width=True):
+        st.session_state.pop("paste_grid", None)
+        st.rerun()
+
+    with st.expander("Paste as text instead"):
+        st.caption(
+            "If the grid will not take your clipboard, paste the raw block here — tab, "
+            "comma or semicolon separated, header row optional.")
+        txt = st.text_area(
+            "Raw paste", height=180, key="paste", label_visibility="collapsed",
+            placeholder="Date\tDays On\tOil (bbl)\tWater (bbl)\n"
+                        "2018-06-01\t30\t4874\t5288\n"
+                        "2018-07-01\t31\t9896\t3991\n"
+                        "2018-08-01\t31\t9143\t2536")
+    with st.expander("What the columns mean, and why"):
+        st.markdown(COLUMN_NOTES)
+
+    # The grid wins when it has data. Someone who pasted text once, then switched to
+    # the grid, means the grid -- and text left behind in a collapsed expander should
+    # not quietly override what is visibly on screen.
+    if len(filled) >= 5:
+        raw, src_label = filled.reset_index(drop=True), "pasted table"
+        if (txt or "").strip():
+            st.info("Using the table. There is also text in **Paste as text instead** "
+                    "below — clear the table if you meant to use that.")
+    elif (txt or "").strip():
+        raw, src_label = txt, "pasted text"
+    else:
         st.stop()
-    raw = txt
-    src_label = "pasted data"
 elif source == "Upload":
-    up = st.sidebar.file_uploader("Monthly CSV", type=["csv", "txt", "tsv"],
-                                  help="Same columns as the paste box.")
+
+    up = st.sidebar.file_uploader(
+        "Production file", type=["csv", "txt", "tsv", "xlsx", "xlsm", "xls"],
+        help="CSV, tab-separated text, or an Excel workbook. In a workbook the first "
+             "sheet that holds a table with a date column is used, so a cover sheet in "
+             "front of the data is fine.")
     if up is None:
         st.markdown("### Upload a production history")
         st.markdown(PASTE_HELP.replace("**Paste it straight out of a spreadsheet**",
@@ -277,13 +480,14 @@ if guess_days is None and days_col is None:
                        "downtime will look like decline.")
 
 try:
-    s_full = _read_csv(raw, src_label, col, days_col, date_col)
+    s_full = _read_csv(raw, src_label, col, days_col, date_col,
+                       fluid.lower(), VIN)
 except (ValueError, FileNotFoundError) as e:
     st.error(f"**Could not use that data.** {e}")
     st.markdown(PASTE_HELP)
     st.stop()
 
-unit = s_full.unit
+unit = VUNIT          # display label; the data itself is field units
 n_all = len(s_full.t)
 
 st.sidebar.divider()
@@ -311,11 +515,12 @@ if len(s.t) < 5:
 st.sidebar.divider()
 st.sidebar.subheader("Forecast")
 
-qab = st.sidebar.number_input(
-    f"Abandonment rate ({unit}/d)", min_value=0.01,
-    value=float(50.0 if s.is_gas else 10.0), step=1.0,
+qab_disp = unum(
+    st.sidebar, f"Abandonment rate ({unit}/d)", "qab",
+    (50.0 if IS_GAS else 10.0) / VFACTOR, min_value=1e-6, step=1.0, format="%.4g",
     help="For b ≥ 1 the hyperbolic integral does not converge, so this is what makes "
          "the EUR finite. It is doing real work — state it when you report.")
+qab = qab_disp * VFACTOR          # the fit and EUR work in field units
 dmin_pct = st.sidebar.number_input(
     "Terminal decline (%/yr effective)", 0.0, 50.0, 6.0, step=0.5,
     help="A policy choice, held fixed during the fit. The history has not reached it "
@@ -344,15 +549,112 @@ seed = st.sidebar.number_input("Seed", 0, 10_000, 1, step=1,
                                help="Fixed so the band is reproducible.")
 
 st.sidebar.divider()
-st.sidebar.subheader("Volumes in place")
-cap_on = st.sidebar.checkbox("Cap the forecast at a known volume", value=False,
-                             help="STOIIP/GIIP from a static model, or OGIP from the "
-                                  "Material balance tab. Off by default — see the "
-                                  "extrapolation multiple on the Forecast tab.")
-in_place = rf = None
-if cap_on:
-    in_place = st.sidebar.number_input(f"In place (MM{unit})", 0.0, value=10.0, step=1.0) * 1e6
-    rf = st.sidebar.number_input("Recovery factor (%)", 1.0, 100.0, 70.0, step=5.0)
+st.sidebar.subheader("Volume in place — this well")
+st.sidebar.caption(
+    "The volume **this well** is connected to, not the reservoir's total. A single-well "
+    "forecast can only be checked against a single-well volume.")
+
+IP_ROUTES = ["Off", "Enter it", "Volumetric", "From the decline"]
+ip_route = st.sidebar.radio("How to get it", IP_ROUTES, key="ip_route",
+                            help="Material balance is on its own tab — it has a button to "
+                                 "send its answer here.")
+
+# A value sent over from the Material balance tab wins until the route is changed.
+if st.session_state.get("ip_from_mb") and ip_route == "Off":
+    ip_route = "From material balance"
+
+in_place = None
+ip_source = ""
+FLUID = fluid.lower()
+
+if ip_route == "Enter it":
+    # Gas volumes are already in Mcf, so a Bcf entry is x1e6; oil is bbl, so MMbbl is x1e6.
+    # Entered in the display system, converted straight to field like everything else.
+    big = ("Bcf" if IS_GAS else "MMbbl") if U.name == "field" else \
+          ("10⁹m³" if IS_GAS else "10⁶m³")
+    scale_disp = 1e6                       # both Bcf/Mcf and 10⁹m³/10³m³ are x1e6
+    val = unum(st.sidebar, f"{'GIIP' if IS_GAS else 'STOIIP'} ({big})", "ip_direct", 10.0,
+               min_value=0.0, step=1.0, format="%.6g",
+               help="For THIS well's drainage volume, not the reservoir.")
+    in_place = val * scale_disp * VFACTOR if val > 0 else None
+    ip_source = f"entered directly: {val:g} {big}"
+
+elif ip_route == "Volumetric":
+    st.sidebar.caption("Drainage area for **this well**, not the field.")
+    c1, c2 = st.sidebar.columns(2)
+    area_d = unum(c1, f"Drainage area ({U.area})", "v_area", 160.0 / U.area_to_acre,
+                  min_value=0.01, max_value=1e6, step=10.0, format="%.4g")
+    pay_d = unum(c2, f"Net pay ({U.length})", "v_pay", 50.0 / U.length_to_ft,
+                 min_value=0.01, max_value=2e4, step=5.0, format="%.4g")
+    area, pay = area_d * U.area_to_acre, pay_d * U.length_to_ft
+    c3, c4 = st.sidebar.columns(2)
+    poro = c3.number_input("Porosity (frac)", 0.01, 0.60, 0.20, step=0.01, key="v_poro")
+    swi = c4.number_input("Water sat. (frac)", 0.0, 0.95, 0.25, step=0.05, key="v_sw")
+    try:
+        if IS_GAS:
+            c5, c6 = st.sidebar.columns(2)
+            pi_d = unum(c5, f"Initial pressure ({U.pressure})", "v_pi",
+                        U.pressure_from_psia(4000.0), min_value=1.0, max_value=2e5,
+                        step=100.0, format="%.6g")
+            t_d = unum(c6, f"Temperature ({U.temperature})", "v_t",
+                       U.temperature_from_degf(200.0), min_value=-50.0, max_value=500.0,
+                       step=5.0, format="%.4g")
+            sg_v = st.sidebar.number_input("Gas gravity", 0.55, 1.2, 0.65, step=0.01,
+                                           key="v_sg")
+            pi_v, t_v = U.pressure_to_psia(pi_d), U.temperature_to_degf(t_d)
+            # scf -> Mcf, which is the field unit the rest of the app works in
+            in_place = dca.volumetric_gas_in_place(area, pay, poro, swi, pi_v, t_v,
+                                                   sg_v) / 1000.0
+            ip_source = (f"volumetric · {area_d:,.4g} {U.area} × {pay_d:,.4g} {U.length} × "
+                         f"{poro:.0%} φ × {1-swi:.0%} Sg at {pi_d:,.6g} {U.pressure}")
+        else:
+            boi = st.sidebar.number_input("Bo initial (rb/STB)", 1.0, 3.0, 1.25, step=0.05,
+                                          key="v_boi",
+                                          help="Reservoir barrels per stock-tank barrel — "
+                                               "dimensionless in effect, so the same number "
+                                               "in either unit system.")
+            in_place = dca.volumetric_oil_in_place(area, pay, poro, swi, boi)
+            ip_source = (f"volumetric · {area_d:,.4g} {U.area} × {pay_d:,.4g} {U.length} × "
+                         f"{poro:.0%} φ × {1-swi:.0%} So ÷ Boi {boi:.2f}")
+    except ValueError as e:
+        st.sidebar.error(str(e))
+
+elif ip_route == "From the decline":
+    mv_side = dca.movable_volume_from_decline(s.cum, s.q)
+    if mv_side is None:
+        st.sidebar.warning("Rate is not falling with cumulative on this window, so there "
+                           "is no line to extrapolate. Use another route.")
+    else:
+        rf_mov = st.sidebar.number_input(
+            "Recovery factor on the movable volume (%)", 1.0, 100.0,
+            60.0 if IS_GAS else 30.0, step=5.0, key="mv_rf",
+            help="The intercept is what the well can MOVE, not what is in place. "
+                 "Divide by a recovery factor to get in place.")
+        in_place = mv_side.movable / (rf_mov / 100.0)
+        ip_source = (f"decline · movable {vol(mv_side.movable)} at q→0 "
+                     f"(R² {mv_side.r2:.3f}) ÷ {rf_mov:g}% RF")
+        if mv_side.r2 < 0.7:
+            st.sidebar.warning(f"R² {mv_side.r2:.2f} — the q-vs-cumulative points do not "
+                               "form a line, so this intercept is not meaningful.")
+
+elif ip_route == "From material balance":
+    in_place = st.session_state.get("ip_from_mb")
+    ip_source = st.session_state.get("ip_from_mb_src", "material balance")
+    st.sidebar.success(f"Using {vol(in_place)} from the Material balance tab.")
+    if st.sidebar.button("Clear it"):
+        st.session_state.pop("ip_from_mb", None)
+        st.rerun()
+
+DEFAULT_RF = {"gas_vol": 85.0, "gas_wd": 60.0, "oil": 30.0}
+max_rf = st.sidebar.number_input(
+    "Maximum recovery factor (%)", 1.0, 100.0,
+    float(DEFAULT_RF["gas_vol"] if IS_GAS else DEFAULT_RF["oil"]),
+    step=5.0, key="max_rf",
+    help=("Gas: 80–90% volumetric, 50–70% under water drive. "
+          "Oil: 5–15% depletion drive, 20–40% water drive or waterflood, "
+          "30–60% with good sweep. This is the ceiling the forecast is checked against."))
+cap_on = in_place is not None
+rf = max_rf
 
 
 # ---------------------------------------------------------------------------
@@ -388,15 +690,21 @@ cum_before = float(s_full.cum[start - 1]) if start > 0 else 0.0
 cum_to_date = float(s_full.cum[end - 1])
 beyond = float(s_full.cum[-1]) - cum_to_date
 
-st.title("Decline Curve Workbench")
+st.title(WELL_LABEL or "Decline Curve Workbench")
 st.caption(
-    f"**{src_label}** · {s.column} · {n_all} producing periods, fitting {len(s.t)} "
+    (f"{fluid.lower()} · {unit_name.lower()} units · " if WELL_LABEL else "")
+    + f"**{src_label}** · {s.column} · {n_all} producing periods, fitting {len(s.t)} "
     f"({s.dates.iloc[0]:%b %Y} – {s.dates.iloc[-1]:%b %Y}) · "
-    f"cum to date {fmt(cum_to_date, unit)}"
-    + (f" · {fmt(beyond, unit)} produced after the fit window" if beyond > 0 else ""))
+    f"cum to date {vol(cum_to_date)}"
+    + (f" · {vol(beyond)} produced after the fit window" if beyond > 0 else ""))
 
-tab_f, tab_d, tab_w, tab_m, tab_t = st.tabs(
-    ["Forecast", "Diagnostics", "Water", "Material balance", "Data"])
+# The four numbers that describe this well, reconciled against each other. Built
+# before the tabs so the Forecast tab and the In-place tab show the same thing.
+wv = dca.WellVolumes(in_place=in_place, cum=cum_to_date, eur=primary["eur"].eur,
+                     unit=unit, max_rf_pct=max_rf, source=ip_source)
+
+tab_f, tab_d, tab_w, tab_v, tab_m, tab_t = st.tabs(
+    ["Forecast", "Diagnostics", "Water", "In place", "Material balance", "Data"])
 
 
 # ---------------------------------------------------------------------------
@@ -412,19 +720,20 @@ with tab_f:
                          dmin if primary_key == "modhyp" else None, seed)
         band = dca.pxx(dist) if len(dist) else None
 
-    cap = (in_place * rf / 100.0) if cap_on and in_place else None
     shown_eur = primary["eur"].eur
-    capped = cap is not None and shown_eur > cap
 
-    c = st.columns(6)
-    c[0].metric("Cum at fit end", fmt(cum_to_date, unit))
-    c[1].metric("Remaining", fmt(primary["remaining"], unit),
+    # Four columns, not six: at six the values truncate to "321.4 M..." on a laptop.
+    c = st.columns(4)
+    c[0].metric("Cumulative to date", vol(cum_to_date))
+    c[1].metric("Remaining (decline)", vol(primary["remaining"]),
                 help="From the end of the fit window, not the last row in the file.")
     c[2].metric("EUR — P50" if band else "EUR",
-                fmt(band["P50"] if band else shown_eur, unit))
-    c[3].metric("EUR — P90 (low)", fmt(band["P90"], unit) if band else "—")
-    c[4].metric("EUR — P10 (high)", fmt(band["P10"], unit) if band else "—")
-    c[5].metric("Well life", f"{primary['eur'].years:.1f} yr")
+                vol(band["P50"] if band else shown_eur),
+                delta=(f"P90 {vol(band['P90'])}  ·  P10 {vol(band['P10'])}"
+                       if band else None), delta_color="off",
+                help="P90 and P10 under the reserves exceedance convention, so P90 is the "
+                     "LOW case." if band else None)
+    c[3].metric("Well life", f"{primary['eur'].years:.1f} yr")
 
     if primary["eur"].t_end <= float(s.t[-1]) + 1e-6 and primary["remaining"] <= 0:
         why = ("the horizon" if primary["eur"].t_end >= horizon * 12 - 1e-6
@@ -438,8 +747,9 @@ with tab_f:
                "Lower the abandonment rate if this well is still economic."))
     elif float(s.q[-1]) <= qab:
         st.warning(
-            f"The last fitted rate is {s.q[-1]:,.1f} {unit}/d, at or below the abandonment "
-            f"rate of {qab:g} {unit}/d — so remaining reads zero and the EUR is just what "
+            f"The last fitted rate is {dsp(s.q[-1]):,.4g} {unit}/d, at or below the "
+            f"abandonment rate of {qab_disp:g} {unit}/d — so remaining reads zero and the "
+            f"EUR is just what "
             "has already been produced. Lower the abandonment rate in the sidebar if this "
             "well is still economic.")
 
@@ -454,10 +764,39 @@ with tab_f:
         st.success(f"**Extrapolation multiple {mult:.2f}×** — {verdict}. "
                    "Most of the volume is already history; the curve is interpolating.")
 
-    if capped:
-        st.warning(f"The in-place cap binds: {fmt(cap, unit)} recoverable "
-                   f"({fmt(in_place, unit)} in place × {rf:g}% RF) against a fitted EUR of "
-                   f"{fmt(shown_eur, unit)}. Report the cap, not the curve.")
+    if wv.in_place:
+        v = st.columns(4)
+        v[0].metric(f"{'GIIP' if s.is_gas else 'STOIIP'} — this well", vol(wv.in_place),
+                    help=wv.source or None)
+        v[1].metric("Recovered to date", f"{wv.rf_to_date_pct:.1f}%",
+                    delta=vol(wv.cum), delta_color="off")
+        v[2].metric("Ultimate recovery (EUR ÷ in place)", f"{wv.rf_ultimate_pct:.1f}%",
+                    delta=f"ceiling {wv.max_rf_pct:.0f}%", delta_color="off")
+        v[3].metric(f"Remaining at {wv.max_rf_pct:.0f}% RF", vol(wv.capped_remaining),
+                    delta=f"decline says {vol(wv.remaining)}", delta_color="off")
+
+        if wv.rf_to_date_pct and wv.rf_to_date_pct > wv.max_rf_pct:
+            st.error(f"**{wv.verdict.capitalize()}.** This well has already produced more "
+                     "than the in-place volume allows. What has been produced is measured; "
+                     "the in-place number is the estimate, so that is the one to revisit — "
+                     "most often the drainage area is too small, or the well is draining "
+                     "beyond the rock mapped to it.")
+        elif wv.rf_ultimate_pct > wv.max_rf_pct:
+            st.error(f"**{wv.verdict.capitalize()}.** The decline curve does not know how "
+                     f"much fluid is in the ground; this says the forecast is asking for "
+                     f"more than the rock holds. Either the in-place volume is too small, "
+                     f"the recovery ceiling is too low, or — most often — the extrapolation "
+                     f"is too optimistic. The capped remaining of "
+                     f"{vol(wv.capped_remaining)} is the defensible number.")
+        elif wv.rf_ultimate_pct > 0.9 * wv.max_rf_pct:
+            st.warning(f"**{wv.verdict.capitalize()}.** Worth a second look at both the "
+                       "extrapolation and the in-place estimate.")
+        else:
+            st.success(f"**{wv.verdict.capitalize()}.** The forecast and the volume in "
+                       "place are consistent.")
+    else:
+        st.caption("No in-place volume set — the forecast is unconstrained. Set one in the "
+                   "sidebar, or work one out on the **In place** tab.")
 
     left, right = st.columns([3, 2])
     with left:
@@ -469,7 +808,7 @@ with tab_f:
                                   "answer and a wrong one.")
         fig = go.Figure()
         x_obs = s.cum if vs_cum else s.t
-        fig.add_trace(go.Scatter(x=x_obs, y=s.q, mode="markers", name="observed",
+        fig.add_trace(go.Scatter(x=dsp(x_obs), y=dsp(s.q), mode="markers", name="observed",
                                  marker=dict(size=5, color="#14181a")))
         t_end = max(r["eur"].t_end for r in results)
         tt = np.linspace(float(s.t[0]), t_end, 400)
@@ -479,17 +818,18 @@ with tab_f:
             xx = ([s.cum[0] + np.array([dca.cum_between(k, r["fit"].p, float(s.t[0]), x)
                                         for x in tt])] if vs_cum else [tt])[0]
             fig.add_trace(go.Scatter(
-                x=xx, y=qq, mode="lines", name=MODELS[k].name,
+                x=dsp(xx) if vs_cum else xx, y=dsp(qq), mode="lines", name=MODELS[k].name,
                 line=dict(color=SERIES_COLOURS[i % len(SERIES_COLOURS)],
                           width=3 if k == primary_key else 1.4)))
-        fig.add_hline(y=qab, line_dash="dash", line_color="#7e8286",
-                      annotation_text=f"economic limit {qab:g} {unit}/d")
+        fig.add_hline(y=dsp(qab), line_dash="dash", line_color="#7e8286",
+                      annotation_text=f"economic limit {qab_disp:.4g} {unit}/d")
         if not vs_cum:
             fig.add_vline(x=float(s.t[-1]), line_dash="dot", line_color="#7e8286",
                           annotation_text="fit end")
-        lo_y = min(float(np.min(s.q)), qab) / 3.0
-        fig.update_yaxes(range=[math.log10(lo_y), math.log10(float(np.max(s.q)) * 3)]
-                         if logy else [0, float(np.max(s.q)) * 1.1])
+        lo_y = dsp(min(float(np.min(s.q)), qab)) / 3.0
+        hi_y = dsp(float(np.max(s.q)))
+        fig.update_yaxes(range=[math.log10(lo_y), math.log10(hi_y * 3)]
+                         if logy else [0, hi_y * 1.1])
         st.plotly_chart(theme_axes(fig, f"cumulative ({unit})" if vs_cum
                                    else "months on production",
                                    f"rate ({unit}/d)", ylog=logy), width="stretch")
@@ -504,11 +844,11 @@ with tab_f:
                        "This is **fit** uncertainty only. Model uncertainty — the spread "
                        "across the table below — is usually larger, and window choice "
                        "larger still.")
-            hist = go.Figure(go.Histogram(x=dist, nbinsx=40, marker_color="#2a78d6"))
+            hist = go.Figure(go.Histogram(x=dsp(dist), nbinsx=40, marker_color="#2a78d6"))
             for lbl, v, colr in (("P90", band["P90"], "#e34948"),
                                  ("P50", band["P50"], "#14181a"),
                                  ("P10", band["P10"], "#1baf7a")):
-                hist.add_vline(x=v, line_color=colr, annotation_text=lbl)
+                hist.add_vline(x=dsp(v), line_color=colr, annotation_text=lbl)
             st.plotly_chart(theme_axes(hist, f"EUR ({unit})", "replicates", height=300),
                             width="stretch")
         else:
@@ -532,7 +872,7 @@ with tab_f:
     eurs = [r["eur"].eur for r in results]
     if len(eurs) > 1 and min(eurs) > 0:
         st.caption(
-            f"Model spread: {fmt(min(eurs), unit)} to {fmt(max(eurs), unit)}, a factor of "
+            f"Model spread: {vol(min(eurs))} to {vol(max(eurs))}, a factor of "
             f"**{max(eurs) / min(eurs):.2f}×**. ΔAICc under 2 is a tie; over 7 is real "
             "evidence against. But AICc measures fit to the history — two models that tie "
             "on it can differ by a factor of two in EUR, which is why every model is shown.")
@@ -612,7 +952,8 @@ with tab_d:
                    "assumption that this line is straight. 1/D is a derivative of noisy "
                    "data, so read the trend, never point to point.")
 
-        fig = go.Figure(go.Scatter(x=s.cum, y=s.q, mode="markers", name="rate vs Np",
+        fig = go.Figure(go.Scatter(x=dsp(s.cum), y=dsp(s.q), mode="markers",
+                                   name="rate vs Np",
                                    marker=dict(size=5, color="#1baf7a")))
         st.plotly_chart(theme_axes(fig, f"cumulative ({unit})", f"rate ({unit}/d)",
                                    height=330), width="stretch")
@@ -622,18 +963,19 @@ with tab_d:
 
     with g2:
         pos = s.t > 0
-        fig = go.Figure(go.Scatter(x=np.sqrt(s.t[pos]), y=1.0 / s.q[pos], mode="markers",
-                                   name="1/q", marker=dict(size=5, color="#4a3aa7")))
+        fig = go.Figure(go.Scatter(x=np.sqrt(s.t[pos]), y=1.0 / dsp(s.q[pos]),
+                                   mode="markers", name="1/q",
+                                   marker=dict(size=5, color="#4a3aa7")))
         st.plotly_chart(theme_axes(fig, "√t (months^½)", f"1/q (d/{unit})", height=330),
                         width="stretch")
         st.caption("**1/q vs √t.** Straight means transient linear flow, i.e. "
                    "fracture-dominated and not yet at the boundaries.")
 
-        fig = go.Figure(go.Scatter(x=s.t[pos], y=s.q[pos], mode="markers", name="rate",
-                                   marker=dict(size=5, color="#eda100")))
+        fig = go.Figure(go.Scatter(x=s.t[pos], y=dsp(s.q[pos]), mode="markers",
+                                   name="rate", marker=dict(size=5, color="#eda100")))
         if slope is not None:
             tt = s.t[pos]
-            ref = float(s.q[pos][0]) * (tt / tt[0]) ** -0.5
+            ref = dsp(float(s.q[pos][0])) * (tt / tt[0]) ** -0.5
             fig.add_trace(go.Scatter(x=tt, y=ref, mode="lines", name="−½ slope",
                                      line=dict(color="#7e8286", dash="dot")))
         st.plotly_chart(theme_axes(fig, "months (log)", f"rate ({unit}/d, log)",
@@ -681,23 +1023,23 @@ with tab_w:
             m = st.columns(5)
             m[0].metric("Water cut now", f"{wa.fw_now:.1%}", delta=f"WOR {wa.wor_now:.2f}",
                         delta_color="off")
-            m[1].metric("Water produced", fmt(wa.cum_water, "bbl"))
+            m[1].metric("Water produced", liq(wa.cum_water))
             m[2].metric(f"Np at {ec:.0%} — semilog",
-                        "—" if weak_s else fmt(wa.np_semilog, unit),
+                        "—" if weak_s else fmt(wa.np_semilog),
                         delta=None if not wa.semilog else f"R² {wa.semilog['r2']:.3f}",
                         delta_color="off")
             m[3].metric(f"Np at {ec:.0%} — X-plot",
-                        "—" if weak_x else fmt(wa.np_xplot, unit),
+                        "—" if weak_x else vol(wa.np_xplot),
                         delta=None if not wa.xplot else f"R² {wa.xplot['r2']:.3f}",
                         delta_color="off")
             rem_w = (wa.np_semilog - wa.cum_oil) if not weak_s else float("nan")
-            m[4].metric("Remaining oil", "—" if weak_s else fmt(max(rem_w, 0), unit))
+            m[4].metric("Remaining oil", "—" if weak_s else vol(max(rem_w, 0)))
 
             if past_s:
                 st.warning(
                     f"**This well is already past {ec:.0%} water cut.** The WOR trend "
                     f"(R² {wa.semilog['r2']:.3f}) puts Np at that limit at "
-                    f"{fmt(wa.np_semilog, unit)}, below the {fmt(wa.cum_oil, unit)} already "
+                    f"{vol(wa.np_semilog)}, below the {vol(wa.cum_oil)} already "
                     "produced. Water-based remaining oil is zero at this limit — raise the "
                     "economic water cut above if the well is still being produced "
                     "economically, which at this cut is a facilities and disposal question "
@@ -712,20 +1054,20 @@ with tab_w:
                 rel = ("materially more optimistic" if wa.np_semilog > arps * 1.15
                        else "materially more conservative" if wa.np_semilog < arps * 0.85
                        else "within 15% of each other")
-                st.info(f"The WOR trend gives {fmt(wa.np_semilog, unit)} against "
-                        f"{fmt(arps, unit)} from the {MODELS[primary_key].name} case — "
+                st.info(f"The WOR trend gives {vol(wa.np_semilog)} against "
+                        f"{vol(arps)} from the {MODELS[primary_key].name} case — "
                         f"{rel}. A wide gap is information: the rate decline and the water "
                         "trend are telling different stories about what kills this well.")
 
             wor = s.water / s.volume
             g1, g2 = st.columns(2)
             with g1:
-                fig = go.Figure(go.Scatter(x=s.cum, y=wor, mode="markers",
+                fig = go.Figure(go.Scatter(x=dsp(s.cum), y=wor, mode="markers",
                                            marker=dict(size=5, color="#2a78d6")))
                 if wa.semilog and not weak_s:
                     xs = np.array([s.cum[0], max(wa.np_semilog, s.cum[-1])])
                     fig.add_trace(go.Scatter(
-                        x=xs, y=np.exp(wa.semilog["slope"] * xs + wa.semilog["intercept"]),
+                        x=dsp(xs), y=np.exp(wa.semilog["slope"] * xs + wa.semilog["intercept"]),
                         mode="lines", name="trend", line=dict(color="#eb6834", dash="dash")))
                 fig.add_hline(y=ec / (1 - ec), line_dash="dot",
                               annotation_text=f"{ec:.0%} water cut")
@@ -736,13 +1078,15 @@ with tab_w:
                            "sweep or a changing drive.")
             with g2:
                 sel = (s.water / (s.water + s.volume)) >= floor
-                fig = go.Figure(go.Scatter(x=dca.x_of(wor[sel]), y=s.cum[sel], mode="markers",
+                fig = go.Figure(go.Scatter(x=dca.x_of(wor[sel]), y=dsp(s.cum[sel]),
+                                           mode="markers",
                                            marker=dict(size=5, color="#1baf7a")))
                 if wa.xplot and not weak_x:
                     xs = np.linspace(float(dca.x_of(max(wor[sel].min(), 1.01))),
                                      float(dca.x_of(ec / (1 - ec))), 20)
                     fig.add_trace(go.Scatter(
-                        x=xs, y=wa.xplot["slope"] * xs + wa.xplot["intercept"], mode="lines",
+                        x=xs, y=dsp(wa.xplot["slope"] * xs + wa.xplot["intercept"]),
+                        mode="lines",
                         name="trend", line=dict(color="#eb6834", dash="dash")))
                 st.plotly_chart(theme_axes(fig, "X = ln(WOR) + 1 + 1/WOR",
                                            f"cumulative oil ({unit})", height=340),
@@ -768,13 +1112,137 @@ with tab_w:
 
 
 # ---------------------------------------------------------------------------
+# In place -- the well's own volume, and the four numbers reconciled
+# ---------------------------------------------------------------------------
+
+with tab_v:
+    st.subheader(f"{'Gas' if s.is_gas else 'Oil'} in place — this well")
+    st.markdown(
+        "This is the volume **this well** is connected to and can drain, not the "
+        "reservoir's total. The distinction is the whole point: a single-well forecast "
+        "can only be checked against a single-well volume. Summing well forecasts against "
+        "a reservoir number is valid under volumetric depletion and fails badly under a "
+        "shared aquifer — one string in the sample water-drive reservoir forecasts "
+        "145.7 Bcf remaining on its own history where the entire reservoir allows "
+        "roughly 8–52 Bcf.")
+
+    st.markdown("#### The four numbers")
+    if wv.in_place:
+        frame = wv.as_frame()
+        frame[f"Volume ({unit})"] = [vol(v) for v in frame[f"Volume ({unit})"]]
+        st.dataframe(frame, width="stretch", hide_index=True)
+    else:
+        st.info("Set an in-place volume in the sidebar and the table fills in: in place, "
+                "cumulative to date, EUR, remaining reserves, and the recovery factor each "
+                "one implies.")
+        st.dataframe(pd.DataFrame([
+            ("In place", "— set it in the sidebar"),
+            ("Cumulative to date", vol(wv.cum)),
+            ("EUR (decline forecast)", vol(wv.eur)),
+            ("Remaining reserves", vol(wv.remaining)),
+        ], columns=["", f"Volume ({unit})"]), width="stretch", hide_index=True)
+
+    st.markdown("#### The three routes, and what each one needs")
+    r1, r2, r3 = st.columns(3)
+    r1.markdown(
+        "**Volumetric**\n\nDrainage area, net pay, porosity, water saturation, and an FVF.\n\n"
+        "The only route that works before the well has produced anything. Its weakness is "
+        "the drainage area: for a vertical well that is roughly the spacing unit, but for a "
+        "horizontal it is the stimulated volume, and getting it wrong scales the answer "
+        "linearly.")
+    r2.markdown(
+        "**Material balance**\n\nWell-level static pressures against this well's own "
+        "cumulative.\n\n"
+        "Gives the **connected** volume — what the well has actually shown it can reach, "
+        "which is often less than the rock mapped to it. Needs buildups long enough to have "
+        "stabilised. On the Material balance tab.")
+    r3.markdown(
+        "**From the decline**\n\nNothing but the production history.\n\n"
+        "Under boundary-dominated flow at roughly constant bottomhole pressure, rate falls "
+        "linearly with cumulative and the intercept is the movable volume. Most wells have "
+        "a production history and no surveys, which is what makes this worth having.")
+
+    st.markdown("#### Rate against cumulative — the decline route, worked")
+    mv = dca.movable_volume_from_decline(s.cum, s.q)
+    if mv is None:
+        st.warning("Rate is not falling with cumulative on this fit window, so there is no "
+                   "line to extrapolate. That is usually a well still in transient flow, one "
+                   "held on a plateau, or one whose drawdown keeps changing.")
+    else:
+        m = st.columns(4)
+        m[0].metric("Movable volume at q → 0", vol(mv.movable))
+        m[1].metric("Already produced", vol(mv.already))
+        m[2].metric("Movable remaining", vol(mv.remaining_movable))
+        m[3].metric("R² of the line", f"{mv.r2:.3f}",
+                    delta="usable" if mv.r2 >= 0.7 else "not a line",
+                    delta_color="normal" if mv.r2 >= 0.7 else "inverse")
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=dsp(s.cum), y=dsp(s.q), mode="markers", name="observed",
+                                 marker=dict(size=5, color="#14181a")))
+        # The same trailing-window line dca fitted, drawn out to its intercept.
+        late = s.cum >= s.cum[int(len(s.cum) * 0.4)]
+        sl, ic = np.polyfit(s.cum[late], s.q[late], 1)
+        xs = np.array([float(s.cum[0]), mv.movable])
+        fig.add_trace(go.Scatter(x=dsp(xs), y=dsp(sl * xs + ic), mode="lines",
+                                 name="boundary-dominated trend",
+                                 line=dict(color="#eb6834", dash="dash")))
+        fig.add_vline(x=dsp(mv.movable), line_dash="dot", line_color="#1baf7a",
+                      annotation_text=f"movable {vol(mv.movable)}")
+        fig.add_vline(x=dsp(float(s.cum[-1])), line_dash="dot", line_color="#7e8286",
+                      annotation_text="produced")
+        st.plotly_chart(theme_axes(fig, f"cumulative ({unit})", f"rate ({unit}/d)",
+                                   height=400), width="stretch")
+        if mv.r2 < 0.7:
+            st.warning(
+                f"**R² {mv.r2:.2f} — do not use this intercept.** The points do not form a "
+                "line, so extrapolating one is arithmetic without meaning. A well in "
+                "transient flow has not felt its boundaries yet and has no drainage volume "
+                "to read; a well whose drawdown keeps changing has a different line every "
+                "few months.")
+        else:
+            st.caption(
+                f"The intercept is what the well can **move** — recoverable to zero rate, "
+                f"not what is in place, and 'zero rate' is not 'zero pressure'. Divide by a "
+                f"recovery factor to get in place: at {wv.max_rf_pct:.0f}% that is "
+                f"{vol(mv.movable / (wv.max_rf_pct / 100.0))}.")
+
+    st.markdown("#### Recovery factors worth arguing with")
+    st.dataframe(pd.DataFrame([
+        ("Gas — volumetric depletion", "80–90%",
+         "abandonment pressure is a small fraction of initial, so most of the gas comes out"),
+        ("Gas — water drive", "50–70%",
+         "water reaches the wells and the reservoir is abandoned with gas still in it"),
+        ("Oil — solution gas drive", "5–15%",
+         "the only energy is dissolved gas coming out of solution"),
+        ("Oil — gas cap expansion", "20–40%", "an expanding gas cap sweeps the oil down"),
+        ("Oil — water drive", "35–60%", "strong aquifer, good sweep"),
+        ("Oil — waterflood", "30–50%", "depends almost entirely on sweep efficiency"),
+    ], columns=["Drive", "Typical RF", "Why"]), width="stretch", hide_index=True)
+    st.caption("These are ranges, not answers. The recovery factor is where most of the "
+               "uncertainty in a reserves number actually lives, and it is worth more "
+               "argument than the decline exponent.")
+
+
+# ---------------------------------------------------------------------------
 # Material balance
 # ---------------------------------------------------------------------------
 
 with tab_m:
-    st.subheader("Gas material balance")
-    st.caption("p/z, Havlena–Odeh drive diagnosis, and a Fetkovich aquifer fit. "
-               "Needs static pressure surveys against cumulative production.")
+    mb_fluid = st.radio("Fluid", ["Gas", "Oil"], horizontal=True, key="mb_fluid",
+                        index=0 if s.is_gas else 1)
+    if mb_fluid == "Gas":
+        st.subheader("Gas material balance")
+        st.caption("p/z, Havlena–Odeh drive diagnosis, and a Fetkovich aquifer fit. "
+                   "Needs static pressure surveys against cumulative gas.")
+    else:
+        st.subheader("Oil material balance")
+        st.caption("Havlena–Odeh as a straight line: F = N·Et. Needs static pressure "
+                   "surveys against cumulative oil.")
+    st.caption("Feed it **this well's** pressures and **this well's** cumulative and the "
+               "answer is that well's connected volume. Feed it field averages and it is "
+               "the reservoir's — useful, but not something a single-well forecast can be "
+               "checked against.")
 
     pres = sorted(glob.glob(os.path.join(DATA_DIR, "*pressure*.csv")))
     MB_MODES = (["Sample reservoir"] if pres else []) + ["Paste", "Upload"]
@@ -803,8 +1271,9 @@ with tab_m:
             help="Tab, comma or semicolon separated. Header row optional.")
         mb_path = mtxt if (mtxt or "").strip() else None
     elif mb_src == "Upload":
-        mup = st.file_uploader("Pressure survey file", type=["csv", "txt", "tsv"],
-                               key="mbup", help="Same columns as the paste box.")
+        mup = st.file_uploader(
+            "Pressure survey file", type=["csv", "txt", "tsv", "xlsx", "xlsm", "xls"],
+            key="mbup", help="CSV, tab-separated text, or an Excel workbook.")
         mb_path = io.BytesIO(mup.getvalue()) if mup else None
     else:
         pn = [os.path.basename(p) for p in pres]
@@ -819,15 +1288,153 @@ with tab_m:
             st.error(f"**Could not read those surveys.** {e}")
             st.markdown(MB_HELP)
             st.stop()
+
+        # One conversion point for the survey table, matching the production side.
+        # Column order is date, pressure, cumulative, condensate, water -- so the
+        # cumulative column is 10^6 m3 in metric against MMscf in field, and the
+        # liquid columns are 10^3 m3 against Mbbl.
+        if U.name != "field":
+            # 1e6 m3 = 1000 x (1e3 m3) = 1000 x 35.3147 Mcf = 35,314.7 Mcf = 35.3147 MMscf
+            MMSCF_PER_E6M3 = dca.E3M3_TO_MCF
+            pdf = pdf.copy()
+            pdf["P"] = U.pressure_to_psia(pdf["P"])
+            pdf["Gp"] = pdf["Gp"] * MMSCF_PER_E6M3
+            pdf["condensate"] = pdf["condensate"] * dca.M3_TO_BBL
+            pdf["water"] = pdf["water"] * dca.M3_TO_BBL
+            st.caption(f"Surveys read as {U.pressure}, 10⁶m³ cumulative gas and 10³m³ "
+                       "liquids, converted to field units for the balance.")
+        if mb_fluid == "Oil":
+            oc = st.columns(4)
+            o_t_d = unum(oc[0], f"Temperature ({U.temperature})", "omb_t",
+                         U.temperature_from_degf(200.0), min_value=-50.0, max_value=500.0,
+                         step=5.0, format="%.4g")
+            o_t = U.temperature_to_degf(o_t_d)
+            o_api = oc[1].number_input("Oil API", 5.0, 60.0, 35.0, step=1.0, key="omb_api")
+            o_sg = oc[2].number_input("Gas gravity", 0.55, 1.2, 0.75, step=0.01, key="omb_sg")
+            o_pb_d = unum(oc[3], f"Bubble point ({U.pressure})", "omb_pb",
+                          U.pressure_from_psia(2500.0), min_value=1.0, max_value=1e5,
+                          step=100.0, format="%.6g",
+                                      help="Above it the oil is undersaturated and produces "
+                                           "by rock and fluid expansion alone.")
+            o_pb = U.pressure_to_psia(o_pb_d)
+            oc2 = st.columns(4)
+            o_sw = oc2[0].number_input("Connate Sw (frac)", 0.0, 0.9, 0.25, step=0.05,
+                                       key="omb_sw")
+            o_cf = oc2[1].number_input("Rock compressibility (1/psi ×1e-6)", 0.5, 50.0, 4.0,
+                                       step=0.5, key="omb_cf",
+                                       help="An undersaturated balance is very sensitive to "
+                                            "this. 3–6e-6 is typical for consolidated "
+                                            "sandstone.") * 1e-6
+            o_cw = oc2[2].number_input("Water compressibility (1/psi ×1e-6)", 1.0, 10.0, 3.0,
+                                       step=0.5, key="omb_cw") * 1e-6
+            o_m = oc2[3].number_input("Gas cap ratio m", 0.0, 10.0, 0.0, step=0.1,
+                                      key="omb_m",
+                                      help="Gas-cap pore volume ÷ oil-zone pore volume. "
+                                           "Zero for no initial gas cap.")
+
+            # The second column is pressure and the third the cumulative -- for oil that
+            # third column is Np in STB, so the loader's Gp is reused as-is.
+            try:
+                omb = dca.oil_material_balance(
+                    pdf["P"], pdf["Gp"], o_t, o_api, o_sg, o_pb,
+                    wp_stb=pdf["water"] * 1000.0 if pdf["water"].abs().sum() else None,
+                    cw=o_cw, cf=o_cf, sw=o_sw, gas_cap_m=o_m)
+            except ValueError as e:
+                st.error(f"**Could not run the balance.** {e}")
+                st.stop()
+
+            om = st.columns(4)
+            om[0].metric("STOIIP", liq(omb.stoiip), delta=f"R² {omb.r2:.4f}",
+                         delta_color="off")
+            om[1].metric("Produced", liq(omb.np_now),
+                         delta=f"{100 * omb.np_now / omb.stoiip:.1f}% recovered"
+                         if omb.stoiip > 0 else None, delta_color="off")
+            om[2].metric("Drive", omb.drive.split(" or ")[0].title())
+            om[3].metric("F/Et rise", f"{omb.rising_f_over_et:.2f}×")
+
+            if omb.water_drive_pct > 25:
+                st.warning(
+                    f"**F/Et climbs {omb.rising_f_over_et:.2f}×**, so roughly "
+                    f"{omb.water_drive_pct:.0f}% of the withdrawal is being met by something "
+                    "outside the oil and its rock — an aquifer, an injector, or a connected "
+                    "compartment. The STOIIP above is then an **upper bound**, not a volume: "
+                    "influx and a larger tank look identical to a straight line. In a "
+                    "synthetic test, adding influx inflated a known 8 MMSTB to 301 MMSTB.")
+            elif not omb.saturated:
+                st.info(
+                    f"**Undersaturated depletion** — every survey is above the "
+                    f"{o_pb_d:,.6g} {U.pressure} bubble point, so the drive is rock and fluid "
+                    "expansion alone. Two consequences worth stating in any report: recovery "
+                    "factors here are small (5–10% is normal), and the STOIIP is very "
+                    "sensitive to rock compressibility, because it is the denominator. Move "
+                    "cf from 4 to 6e-6 and watch the answer move with it.")
+            else:
+                st.success(
+                    f"**Solution-gas drive** — pressure has fallen below the {o_pb_d:,.6g} {U.pressure} "
+                    f"bubble point, so gas is coming out of solution and doing the work. "
+                    f"{omb.depletion_drive_pct:.0f}% of the withdrawal is accounted for by "
+                    "oil, dissolved gas and rock expansion.")
+
+            g1, g2 = st.columns(2)
+            with g1:
+                fig = go.Figure(go.Scatter(x=omb.points["Et"], y=omb.points["F"],
+                                           mode="markers", name="surveys",
+                                           marker=dict(size=9, color="#2a78d6")))
+                xs = np.array([0.0, float(omb.points["Et"].max())])
+                fig.add_trace(go.Scatter(x=xs, y=omb.stoiip * xs, mode="lines",
+                                         name=f"N = {liq(omb.stoiip)}",
+                                         line=dict(color="#eb6834", dash="dash")))
+                st.plotly_chart(theme_axes(fig, "Et — total expansion (rb/STB)",
+                                           "F — net withdrawal (rb)", height=360),
+                                width="stretch")
+                st.caption("**Havlena–Odeh.** F against Et is a straight line through the "
+                           "origin whose slope *is* N. Curvature upward means influx; the "
+                           "line is then fitting energy that did not come from the oil.")
+            with g2:
+                fig = go.Figure(go.Scatter(x=omb.points["Np"], y=omb.points["F_over_Et"],
+                                           mode="lines+markers", name="F/Et",
+                                           line=dict(color="#2a78d6")))
+                fig.add_hline(y=float(omb.points["F_over_Et"].iloc[0]), line_dash="dash",
+                              line_color="#7e8286", annotation_text="first point")
+                st.plotly_chart(theme_axes(fig, "cumulative oil (STB)", "F / Et (STB)",
+                                           height=360), width="stretch")
+                st.caption("Flat means the oil and its rock are supplying all the energy, "
+                           "and the level *is* N. Rising means they are not.")
+
+            st.dataframe(
+                omb.points[["P", "Np", "Bo", "Rs", "Et", "F", "F_over_Et"]]
+                .rename(columns={"P": "Pressure (psia)", "Np": "Cum oil (STB)",
+                                 "Bo": "Bo (rb/STB)", "Rs": "Rs (scf/STB)",
+                                 "Et": "Et (rb/STB)", "F": "F (rb)",
+                                 "F_over_Et": "F/Et (STB)"})
+                .style.format("{:,.4g}"), width="stretch", hide_index=True)
+
+            if st.button(f"Use {liq(omb.stoiip)} as this well's STOIIP",
+                         type="primary", key="send_oil"):
+                st.session_state["ip_from_mb"] = omb.stoiip
+                st.session_state["ip_from_mb_src"] = (
+                    f"oil material balance · R² {omb.r2:.3f} · {omb.drive}")
+                st.session_state["ip_route"] = "Off"
+                st.rerun()
+            st.caption("Sends it to the sidebar, where it becomes the in-place volume the "
+                       "forecast is checked against. Only meaningful if these pressures and "
+                       "this cumulative are **this well's**.")
+            st.stop()
+
         c = st.columns(5)
-        temp = c[0].number_input("Temperature (°F)", 60.0, 400.0, 230.0, step=1.0, key="mb_t")
+        temp_d = unum(c[0], f"Temperature ({U.temperature})", "mb_t",
+                      U.temperature_from_degf(230.0), min_value=-50.0, max_value=500.0,
+                      step=1.0, format="%.4g")
+        temp = U.temperature_to_degf(temp_d)
         sg = c[1].number_input("Gas gravity", 0.55, 1.2, 0.72, step=0.005, format="%.4f", key="mb_sg")
         api = c[2].number_input("Condensate API (0 = none)", 0.0, 90.0, 0.0, step=1.0,
                                 key="mb_api",
                                 help="Converts produced condensate to gas equivalent. "
                                      "Omitting it biases OGIP low and remaining high.")
-        pab = c[3].number_input("Abandonment pressure (psia)", 50.0, 6000.0, 1000.0,
-                                step=50.0, key="mb_pab")
+        pab_d = unum(c[3], f"Abandonment pressure ({U.pressure})", "mb_pab",
+                     U.pressure_from_psia(1000.0), min_value=1.0, max_value=1e5,
+                     step=50.0, format="%.6g")
+        pab = U.pressure_to_psia(pab_d)
         skip = c[4].number_input("Drop earliest surveys", 0, max(len(pdf) - 3, 0), 0,
                                  key="mb_skip",
                                  help="Use this when the consistency guard fires and the "
@@ -951,6 +1558,29 @@ with tab_m:
             st.dataframe(f["locus"].style.format({"G_Bcf": "{:,.0f}", "Wei_MMbbl": "{:,.0f}",
                                                   "J_bbl_d_psi": "{:g}", "rms_pct": "{:.1f}"}),
                          width="stretch", hide_index=True)
+
+            gcol = st.columns(2)
+            if gcol[0].button(f"Use the Fetkovich G ({f['G_Bcf']:,.0f} Bcf) as this well's "
+                              "GIIP", key="send_fetk"):
+                st.session_state["ip_from_mb"] = f["G_Bcf"] * 1e6      # Bcf -> Mcf
+                st.session_state["ip_from_mb_src"] = (
+                    f"Fetkovich aquifer fit · G {f['G_Bcf']:,.0f} Bcf · rms {f['rms_pct']:.1f}%")
+                st.session_state["ip_route"] = "Off"
+                st.rerun()
+            if gcol[1].button(f"Use the p/z intercept ({r.ogip_pz / 1000:,.0f} Bcf) instead",
+                              key="send_pz",
+                              disabled=not r.volumetric,
+                              help=None if r.volumetric else
+                              "Disabled: F/Eg is rising, so the p/z intercept is an artefact "
+                              "rather than a volume."):
+                st.session_state["ip_from_mb"] = r.ogip_pz * 1000.0    # MMscf -> Mcf
+                st.session_state["ip_from_mb_src"] = (
+                    f"p/z intercept · {r.ogip_pz / 1000:,.0f} Bcf · R² {r.r2:.4f}")
+                st.session_state["ip_route"] = "Off"
+                st.rerun()
+            st.caption("Either number becomes the in-place volume the forecast is checked "
+                       "against. It is only a **well** volume if these pressures and this "
+                       "cumulative came from this well.")
 
             if not cap_on:
                 # G is Bcf; the sidebar wants MMcf (the base gas unit) in millions.
