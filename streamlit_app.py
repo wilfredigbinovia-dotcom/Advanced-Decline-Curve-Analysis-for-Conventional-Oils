@@ -62,6 +62,39 @@ SERIES_COLOURS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
 MODEL_ORDER = ["hyperbolic", "modhyp", "duong", "ple", "sepd", "harmonic", "exponential"]
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
 
+# Why the input format is what it is. Shown in the app, because a format request
+# without its reasoning reads as bureaucracy.
+COLUMN_NOTES = """
+**Date** — months are counted from these dates, never from the row order. Shut-in months
+are usually just missing from a production report, so if you count rows a well that sat
+idle for two years looks like it declined through them. The gap has to stay a gap.
+Any recognisable date format works.
+
+**Producing days** — the difference between a *calendar-day* rate (volume ÷ days in the
+month) and an *operated-day* rate (volume ÷ days actually flowing) is the uptime
+fraction. A well that made 9,000 bbl over 10 days is not a 300 bbl/d well that is
+dying; it is a 900 bbl/d well that was down. Without this column every downtime month
+reads as decline, and the fit obliges by finding one.
+
+**Oil or gas volume** — period **volumes**, not rates, because a rate has an uptime
+convention already baked into it and you generally cannot tell which one the source
+used. A volume is unambiguous, and dividing it by producing days gives a rate whose
+meaning is known.
+
+**Water** *(optional)* — unlocks the Water tab: WOR extrapolation, the Ershaghi X-plot,
+and the Chan coning-versus-channelling diagnostic. For a water-drive reservoir the
+water trend is usually the more reliable forecast, because the well dies of water
+rather than of pressure.
+
+**Zero months** — leave them out rather than writing zeros. The fit minimises the error
+in **ln q**, which is undefined at zero; and an omitted month with its date gap intact
+carries exactly the right information, which is that nothing was produced and no time
+should be credited against the decline.
+
+Column *names* do not matter — the app guesses, and anything it gets wrong you can remap
+in the sidebar.
+"""
+
 
 # ---------------------------------------------------------------------------
 # cached compute -- arrays arrive as tuples so Streamlit can hash them
@@ -95,13 +128,11 @@ def _mb(P: tuple, Gp: tuple, cond: tuple, water: tuple, temp: float, sg: float,
 
 
 @st.cache_data(show_spinner=False)
-def _read_csv(path_or_bytes, name: str, column: str | None, days: str):
-    if isinstance(path_or_bytes, bytes):
-        tmp = io.BytesIO(path_or_bytes)
-        df = pd.read_csv(tmp)
-        tmp.seek(0)
-        return dca.load_csv(io.BytesIO(path_or_bytes), column=column, days_column=days)
-    return dca.load_csv(path_or_bytes, column=column, days_column=days)
+def _read_csv(src, name: str, column: str | None, days: str | None, date: str | None):
+    # src is a path, raw upload bytes, or pasted text -- read_table sorts out which.
+    src = io.BytesIO(src) if isinstance(src, bytes) else src
+    return dca.load_frame(dca.read_table(src), column=column, days_column=days,
+                          date_column=date, label=name)
 
 
 # Oilfield volume prefixes, which are not SI: for liquids M = thousand and
@@ -144,6 +175,14 @@ def theme_axes(fig, xlab, ylab, ylog=False, xlog=False, height=460):
 # sidebar: data and settings
 # ---------------------------------------------------------------------------
 
+# The sidebar holds the paste box and the column mapping, which are both wider than
+# Streamlit's 244px default comfortably shows.
+st.markdown(
+    "<style>section[data-testid='stSidebar']{width:390px!important;min-width:390px!important}"
+    "section[data-testid='stSidebar'] textarea{font-family:ui-monospace,SFMono-Regular,"
+    "Menlo,monospace;font-size:12px;white-space:pre}</style>",
+    unsafe_allow_html=True)
+
 st.sidebar.title("Decline Curve Workbench")
 
 samples = sorted(p for p in glob.glob(os.path.join(DATA_DIR, "*.csv"))
@@ -151,28 +190,49 @@ samples = sorted(p for p in glob.glob(os.path.join(DATA_DIR, "*.csv"))
 sample_names = [os.path.basename(p) for p in samples]
 
 # The sample CSVs are optional. Without a data/ folder the app still works -- it just
-# has nothing to show until something is uploaded, so don't offer a dead choice.
-if sample_names:
-    source = st.sidebar.radio("Production data", ["Sample well", "Upload CSV"],
-                              horizontal=True, key="source")
-else:
-    source = "Upload CSV"
+# has nothing to show until something is loaded, so don't offer a dead choice.
+MODES = (["Sample well"] if sample_names else []) + ["Paste", "Upload"]
+source = st.sidebar.radio("Production data", MODES, horizontal=True, key="source",
+                          index=0)
+if not sample_names:
     st.sidebar.caption("No `data/` folder found, so there are no sample wells. "
-                       "Upload a CSV to get started.")
+                       "Paste or upload data to get started.")
+
+PASTE_HELP = (
+    "**Paste it straight out of a spreadsheet** — select the range including the header "
+    "row and paste. Excel and Sheets copy as tab-separated text, which is read directly; "
+    "comma- and semicolon-separated both work too, as does a block with no header row.\n\n"
+    "One row per month. A date column, a production column, and ideally a producing-days "
+    "column. Column names do not matter — anything unrecognised can be mapped below."
+)
 
 raw = None
-if source == "Upload CSV":
-    up = st.sidebar.file_uploader(
-        "Monthly CSV", type="csv",
-        help="Date, Days On, Oil (bbl), Gas (Mcf), Water (bbl). "
-             "Period VOLUMES, not rates. Omit zero months — the date gaps carry them.")
+if source == "Paste":
+    txt = st.sidebar.text_area(
+        "Paste monthly production", height=200, key="paste",
+        placeholder="Date\tDays On\tOil (bbl)\tWater (bbl)\n"
+                    "2018-06-01\t30\t4874\t5288\n"
+                    "2018-07-01\t31\t9896\t3991\n"
+                    "2018-08-01\t31\t9143\t2536",
+        help="Tab, comma or semicolon separated. Header row optional.")
+    if not (txt or "").strip():
+        st.markdown("### Paste your production history")
+        st.markdown(PASTE_HELP)
+        with st.expander("What the columns mean, and why"):
+            st.markdown(COLUMN_NOTES)
+        st.stop()
+    raw = txt
+    src_label = "pasted data"
+elif source == "Upload":
+    up = st.sidebar.file_uploader("Monthly CSV", type=["csv", "txt", "tsv"],
+                                  help="Same columns as the paste box.")
     if up is None:
-        st.info(
-            ("Upload a monthly production CSV, or switch to a sample well in the sidebar."
-             if sample_names else "Upload a monthly production CSV to get started.")
-            + "\n\nExpected columns: `Date`, `Days On`, and at least one of `Oil (bbl)` / "
-              "`Gas (Mcf)`, optionally `Water (bbl)`. Give it period **volumes**, not "
-              "rates, and leave zero months out — the date gaps carry the shut-ins.")
+        st.markdown("### Upload a production history")
+        st.markdown(PASTE_HELP.replace("**Paste it straight out of a spreadsheet**",
+                                       "**A CSV, TSV or tab-separated text file**")
+                    .replace(" — select the range including the header row and paste", ""))
+        with st.expander("What the columns mean, and why"):
+            st.markdown(COLUMN_NOTES)
         st.stop()
     raw = up.getvalue()
     src_label = up.name
@@ -183,23 +243,44 @@ else:
     raw = os.path.join(DATA_DIR, pick)
     src_label = pick
 
-# column mapping
-probe = pd.read_csv(io.BytesIO(raw) if isinstance(raw, bytes) else raw, nrows=5)
-probe.columns = [c.strip() for c in probe.columns]
-prod_cols = [c for c in probe.columns if c.lower().startswith(("oil", "gas"))] or \
-            [c for c in probe.columns[1:]]
-col = st.sidebar.selectbox("Production column", prod_cols, key="prod_col")
-days_col = st.sidebar.selectbox(
-    "Producing-days column",
-    [c for c in probe.columns if "day" in c.lower()] or ["<none>"], key="days_col",
-    help="Rate is volume ÷ producing days, i.e. an operated-day rate. Calendar-day and "
-         "operated-day rates differ by the uptime fraction — mixing them turns downtime "
-         "into apparent decline.")
+# --- column mapping, guessed then overridable ---
+try:
+    probe = dca.read_table(io.BytesIO(raw) if isinstance(raw, bytes) else raw)
+except (ValueError, FileNotFoundError) as e:
+    st.error(f"**Could not read that.** {e}")
+    st.markdown(PASTE_HELP)
+    st.stop()
+
+cols = list(probe.columns)
+guess_date = dca.find_date_column(probe)
+guess_days = dca.find_days_column(probe)
+guess_prod = dca.find_production_columns(probe)
+
+def _pick(label, options, guess, key, help_=None):
+    opts = list(options)
+    idx = opts.index(guess) if guess in opts else 0
+    return st.sidebar.selectbox(label, opts, index=idx, key=key, help=help_)
+
+col = _pick("Production column", guess_prod or cols, (guess_prod or cols)[0], "prod_col",
+            "Oil or gas volume per month. Period volumes, not rates.")
+date_col = _pick("Date column", cols, guess_date or cols[0], "date_col",
+                 "Months are counted from these dates, not from the row order — so an "
+                 "omitted shut-in month stays a gap instead of being compressed away.")
+days_col = _pick("Producing-days column", ["(none — use calendar days)"] + cols,
+                 guess_days or "(none — use calendar days)", "days_col",
+                 "Rate is volume ÷ producing days, i.e. an operated-day rate. Without "
+                 "this, downtime reads as decline.")
+days_col = None if days_col.startswith("(none") else days_col
+
+if guess_days is None and days_col is None:
+    st.sidebar.caption("⚠️ No producing-days column found — rates are calendar-day, so "
+                       "downtime will look like decline.")
 
 try:
-    s_full = _read_csv(raw, src_label, col, days_col)
-except Exception as e:                                   # noqa: BLE001
-    st.error(f"Could not read the file: {e}")
+    s_full = _read_csv(raw, src_label, col, days_col, date_col)
+except (ValueError, FileNotFoundError) as e:
+    st.error(f"**Could not use that data.** {e}")
+    st.markdown(PASTE_HELP)
     st.stop()
 
 unit = s_full.unit
@@ -696,22 +777,48 @@ with tab_m:
                "Needs static pressure surveys against cumulative production.")
 
     pres = sorted(glob.glob(os.path.join(DATA_DIR, "*pressure*.csv")))
-    mb_src = (st.radio("Pressure data", ["Sample reservoir", "Upload CSV"],
-                       horizontal=True, key="mb_src") if pres else "Upload CSV")
-    if mb_src == "Upload CSV":
-        mup = st.file_uploader(
-            "Pressure CSV", type="csv", key="mbup",
-            help="Date, Pressure (psia), Cum gas (MMscf), Cum condensate (Mbbl), "
-                 "Cum water (Mbbl)")
+    MB_MODES = (["Sample reservoir"] if pres else []) + ["Paste", "Upload"]
+    mb_src = st.radio("Pressure data", MB_MODES, horizontal=True, key="mb_src")
+
+    MB_HELP = (
+        "One row per pressure survey, in column order: **date, pressure (psia), "
+        "cumulative gas (MMscf)**, then optionally **cumulative condensate (Mbbl)** and "
+        "**cumulative water (Mbbl)**.\n\n"
+        "Columns are taken by position rather than by name, because survey tables get "
+        "titled a dozen different ways and the order is the one thing that stays put. "
+        "Three surveys is the minimum; the more of the depletion history they span, the "
+        "better the drive diagnosis.\n\n"
+        "Pressures should be static, datum-corrected, and from builds long enough to have "
+        "stabilised."
+    )
+
+    mb_path = None
+    if mb_src == "Paste":
+        mtxt = st.text_area(
+            "Paste pressure surveys", height=170, key="mb_paste",
+            placeholder="Date\tP (psia)\tCum gas (MMscf)\tCum cond (Mbbl)\tCum water (Mbbl)\n"
+                        "2015-09-01\t5496.2\t253.6\t19.6\t0\n"
+                        "2016-11-01\t5477.0\t1030.8\t64.9\t0.006\n"
+                        "2019-11-01\t5141.4\t14949.5\t1305.7\t17.034",
+            help="Tab, comma or semicolon separated. Header row optional.")
+        mb_path = mtxt if (mtxt or "").strip() else None
+    elif mb_src == "Upload":
+        mup = st.file_uploader("Pressure survey file", type=["csv", "txt", "tsv"],
+                               key="mbup", help="Same columns as the paste box.")
         mb_path = io.BytesIO(mup.getvalue()) if mup else None
     else:
         pn = [os.path.basename(p) for p in pres]
         mb_path = os.path.join(DATA_DIR, st.selectbox("Reservoir", pn, key="reservoir")) if pn else None
 
     if mb_path is None:
-        st.info("Upload a pressure-survey CSV, or pick a sample reservoir.")
+        st.markdown(MB_HELP)
     else:
-        pdf = dca.load_pressure_csv(mb_path)
+        try:
+            pdf = dca.load_pressure_csv(mb_path)
+        except (ValueError, FileNotFoundError) as e:
+            st.error(f"**Could not read those surveys.** {e}")
+            st.markdown(MB_HELP)
+            st.stop()
         c = st.columns(5)
         temp = c[0].number_input("Temperature (°F)", 60.0, 400.0, 230.0, step=1.0, key="mb_t")
         sg = c[1].number_input("Gas gravity", 0.55, 1.2, 0.72, step=0.005, format="%.4f", key="mb_sg")

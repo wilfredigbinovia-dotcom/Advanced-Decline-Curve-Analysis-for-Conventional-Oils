@@ -35,7 +35,9 @@ See docs/methods.md for the derivations and the reasoning behind each choice.
 from __future__ import annotations
 
 import argparse
+import io
 import math
+import os
 import sys
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence
@@ -52,7 +54,8 @@ __all__ = [
     "loss_ratio_b", "loglog_slope", "find_plateau", "extrapolation_multiple",
     "wor_analysis", "chan_derivative",
     "z_factor", "material_balance", "fetkovich_fit",
-    "load_csv", "load_pressure_csv",
+    "load_csv", "load_pressure_csv", "read_table", "load_frame",
+    "find_date_column", "find_days_column", "find_production_columns",
 ]
 
 DPM = 30.4375  # days per average month
@@ -1208,79 +1211,268 @@ class Series:
                 f"cum={self.cum[-1]:,.0f} {self.unit}>")
 
 
-def load_csv(path: str, column: Optional[str] = None,
-             days_column: str = "Days On", date_column: str = "Date") -> Series:
-    """Read a monthly production CSV into a Series.
+# --- reading whatever the user actually has -------------------------------
 
-        Date,Days On,Oil (bbl),Gas (Mcf),Water (bbl)
-        2018-06-01,30,4874,4058,5288
+_DELIMS = ["\t", ",", ";", "|"]
+
+
+def read_table(source) -> pd.DataFrame:
+    """Read a table from a path, a file-like object, or a block of PASTED text.
+
+    Pasting is the case this exists for, and pasted data is not CSV: copying a
+    range out of Excel puts TAB-separated text on the clipboard, and copying
+    from a web page or a PDF can give comma, semicolon, pipe, or runs of
+    spaces.
+
+    Delimiters are tried in priority order and the FIRST one that yields a
+    consistent table wins -- not the one that yields the most columns. Taking
+    the most columns looks smarter and is wrong: splitting on whitespace turns
+    `Oil (bbl)` into two columns and silently shifts every value one place
+    left. Whitespace is therefore the last resort, used only when nothing with
+    an actual delimiter character worked.
+
+    A header row is detected rather than assumed: if the first row is entirely
+    numbers and dates, it is data, and generic column names are supplied.
+    """
+    if isinstance(source, pd.DataFrame):
+        df = source.copy()
+    else:
+        text = None
+        if isinstance(source, bytes):
+            text = source.decode("utf-8-sig", errors="replace")
+        elif hasattr(source, "read"):
+            raw = source.read()
+            text = raw.decode("utf-8-sig", errors="replace") if isinstance(raw, bytes) else raw
+        elif isinstance(source, str):
+            # A path only if it plausibly is one. Anything else is content, so
+            # that pasted prose gets a parsing error rather than "file not found".
+            looks_like_path = ("\n" not in source and "\t" not in source
+                               and (os.path.exists(source) or len(source) < 260))
+            if looks_like_path and os.path.exists(source):
+                df = pd.read_csv(source)
+                text = None
+            elif looks_like_path and "\n" not in source and os.sep in source:
+                raise FileNotFoundError(f"no such file: {source}")
+            else:
+                text = source
+
+        if text is not None:
+            text = text.replace("\r\n", "\n").replace("\r", "\n").strip("\n")
+            if not text.strip():
+                raise ValueError("nothing to read -- the box is empty")
+
+            df = None
+            for d in ["\t", ",", ";", "|", r"\s{2,}", r"\s+"]:
+                try:
+                    cand = pd.read_csv(io.StringIO(text), sep=d, engine="python",
+                                       skipinitialspace=True)
+                except Exception:               # noqa: BLE001 -- try the next one
+                    continue
+                if cand.shape[1] >= 2 and len(cand) >= 1:
+                    df = cand
+                    break
+            if df is None:
+                raise ValueError(
+                    "could not find columns in that text. Paste it straight out of a "
+                    "spreadsheet (which gives tab-separated columns), or as "
+                    "comma-separated values, with one row per month.")
+        elif "df" not in dir():
+            df = pd.read_csv(source)
+
+    df.columns = [str(c).strip() for c in df.columns]
+
+    def _is_datalike(v):
+        s = str(v).strip()
+        if not s:
+            return False
+        try:
+            float(s.replace(",", ""))
+            return True
+        except ValueError:
+            pass
+        try:
+            return pd.notna(pd.to_datetime(s, errors="coerce"))
+        except (ValueError, TypeError):
+            return False
+
+    if df.shape[1] >= 2 and all(_is_datalike(c) for c in df.columns):
+        first = pd.DataFrame([list(df.columns)], columns=range(df.shape[1]))
+        df.columns = range(df.shape[1])
+        df = pd.concat([first, df], ignore_index=True)
+        df.columns = ["Date"] + [f"Column {i}" for i in range(2, df.shape[1] + 1)]
+
+    return df.dropna(how="all").reset_index(drop=True)
+
+
+def find_date_column(df: pd.DataFrame) -> Optional[str]:
+    """The column holding the period date, by name first and then by content."""
+    for c in df.columns:
+        if any(w in str(c).lower() for w in ("date", "month", "period", "time")):
+            return c
+    for c in df.columns:                        # fall back to what actually parses
+        s = df[c].dropna().astype(str).head(12)
+        if s.empty:
+            continue
+        try:
+            parsed = pd.to_datetime(s, errors="coerce", format="mixed")
+        except (ValueError, TypeError):
+            continue
+        if parsed.notna().mean() > 0.8:
+            return c
+    return None
+
+
+def find_production_columns(df: pd.DataFrame) -> List[str]:
+    """Columns that plausibly hold oil or gas volumes, best guesses first."""
+    named = [c for c in df.columns if str(c).lower().startswith(("oil", "gas"))]
+    if named:
+        return named
+    date_c = find_date_column(df)
+    numeric = [c for c in df.columns
+               if c != date_c and pd.to_numeric(df[c], errors="coerce").notna().mean() > 0.7]
+
+    # A producing-days column is numeric too, and in an unnamed paste it is often
+    # the first one. Values that all sit in 0-31.5 are days, not volumes.
+    def _is_days(c):
+        v = pd.to_numeric(df[c], errors="coerce").dropna()
+        return not v.empty and float(v.max()) <= 31.5 and float(v.min()) >= 0
+
+    return [c for c in numeric if not _is_days(c)] or numeric
+
+
+def find_days_column(df: pd.DataFrame) -> Optional[str]:
+    """The producing-days column, by name then by shape.
+
+    Without one, rate falls back to a CALENDAR-day rate -- which quietly folds
+    every shut-in month into the decline. Worth looking harder than an exact
+    name match.
+    """
+    for c in df.columns:
+        if "day" in str(c).lower() or str(c).strip().lower() in ("uptime", "dom", "pd"):
+            return c
+    for c in df.columns:                         # values that all sit inside a month
+        v = pd.to_numeric(df[c], errors="coerce").dropna()
+        if len(v) >= 5 and 0 < float(v.min()) and float(v.max()) <= 31.5 and v.mean() > 5:
+            return c
+    return None
+
+
+def load_frame(df: pd.DataFrame, column: Optional[str] = None,
+               days_column: Optional[str] = "Days On",
+               date_column: Optional[str] = None, label: str = "data") -> Series:
+    """Build a Series from an already-read table.
 
     Two things this does that a naive reader does not:
 
     1. TIME COMES FROM THE DATES, not the row order. Zero-production months are
-       omitted from these files, so the date gaps ARE the shut-ins. Counting
-       rows would compress them out of existence and fabricate decline.
+       normally omitted, so the date gaps ARE the shut-ins. Counting rows would
+       compress them out of existence and fabricate decline.
 
     2. Rate is volume / producing days, i.e. an OPERATED-DAY rate. Feeding a
        reported rate straight in inherits whatever uptime convention the source
        used -- and calendar-day and operated-day rates differ by the uptime
        fraction, which is how downtime gets mistaken for decline.
     """
-    df = pd.read_csv(path)
-    df.columns = [c.strip() for c in df.columns]
-    if date_column not in df.columns:
-        raise ValueError(f"no {date_column!r} column in {path}: {list(df.columns)}")
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    if date_column is None:
+        date_column = find_date_column(df)
+    if date_column is None or date_column not in df.columns:
+        raise ValueError(f"no date column found in {label}: {list(df.columns)}")
 
     if column is None:
-        for c in df.columns:
-            if c.lower().startswith(("oil", "gas")):
-                column = c
-                break
+        cands = find_production_columns(df)
+        column = cands[0] if cands else None
     if column is None or column not in df.columns:
-        raise ValueError(f"no production column found in {path}: {list(df.columns)}")
+        raise ValueError(f"no production column found in {label}: {list(df.columns)}")
 
-    df[date_column] = pd.to_datetime(df[date_column])
-    vol = pd.to_numeric(df[column], errors="coerce")
-    days = (pd.to_numeric(df[days_column], errors="coerce")
-            if days_column in df.columns else pd.Series(DPM, index=df.index))
+    dates = pd.to_datetime(df[date_column], errors="coerce", format="mixed")
+    vol = pd.to_numeric(
+        df[column].astype(str).str.replace(",", "", regex=False).str.strip(),
+        errors="coerce")
 
-    ok = vol.notna() & (vol > 0) & days.notna() & (days > 0)
-    df, vol, days = df[ok].reset_index(drop=True), vol[ok].to_numpy(), days[ok].to_numpy()
-    if len(df) < 5:
-        raise ValueError(f"only {len(df)} usable periods in {path}")
+    if not days_column or days_column not in df.columns:
+        days_column = find_days_column(df)
+    if days_column and days_column in df.columns:
+        days = pd.to_numeric(df[days_column], errors="coerce")
+    else:
+        days = pd.Series(DPM, index=df.index)   # no uptime column: calendar days
 
-    d = df[date_column]
-    months = (d.dt.year * 12 + d.dt.month).to_numpy()
+    ok = dates.notna() & vol.notna() & (vol > 0) & days.notna() & (days > 0)
+    if ok.sum() < 5:
+        raise ValueError(
+            f"only {int(ok.sum())} usable periods in {label} -- need at least 5 rows "
+            f"with a valid date and a positive {column!r}")
+
+    df, dates, vol, days = (df[ok].reset_index(drop=True), dates[ok].reset_index(drop=True),
+                            vol[ok].to_numpy(), days[ok].to_numpy())
+    order = np.argsort((dates.dt.year * 12 + dates.dt.month).to_numpy(), kind="stable")
+    dates, vol, days = dates.iloc[order].reset_index(drop=True), vol[order], days[order]
+
+    months = (dates.dt.year * 12 + dates.dt.month).to_numpy()
     t = (months - months[0]).astype(float) + 0.5
 
     water = None
     for c in df.columns:
-        if c.lower().startswith("water"):
-            water = pd.to_numeric(df[c], errors="coerce").fillna(0.0).to_numpy()
+        if str(c).lower().startswith("water"):
+            water = pd.to_numeric(df[c], errors="coerce").fillna(0.0).to_numpy()[order]
             break
 
-    return Series(t=t, q=vol / days, volume=vol, days=days, dates=d,
+    return Series(t=t, q=vol / days, volume=vol, days=days, dates=dates,
                   cum=np.cumsum(vol), column=column,
-                  is_gas="gas" in column.lower(), water=water, frame=df)
+                  is_gas="gas" in str(column).lower(), water=water, frame=df)
 
 
-def load_pressure_csv(path: str) -> pd.DataFrame:
-    """Read a pressure-survey CSV for material balance.
+def load_csv(path, column: Optional[str] = None,
+             days_column: Optional[str] = "Days On",
+             date_column: Optional[str] = None) -> Series:
+    """Read a monthly production table into a Series.
 
-        Date,Pressure (psia),Cum gas (MMscf),Cum condensate (Mbbl),Cum water (Mbbl)
+        Date,Days On,Oil (bbl),Gas (Mcf),Water (bbl)
+        2018-06-01,30,4874,4058,5288
+
+    `path` may be a filename, a file-like object, or pasted text. See
+    load_frame() for what the parsing does and why.
     """
-    df = pd.read_csv(path)
-    df.columns = [c.strip() for c in df.columns]
+    label = path if isinstance(path, str) and "\n" not in path else "the pasted data"
+    return load_frame(read_table(path), column=column, days_column=days_column,
+                      date_column=date_column, label=str(label))
+
+
+def load_pressure_csv(source) -> pd.DataFrame:
+    """Read pressure surveys for material balance, from a file or pasted text.
+
+        Date, Pressure (psia), Cum gas (MMscf), Cum condensate (Mbbl), Cum water (Mbbl)
+
+    Only the first three columns are required. Columns are taken by POSITION
+    after the date, because survey tables are named a dozen different ways and
+    the order is the one thing that is consistent.
+    """
+    df = read_table(source)
     if df.shape[1] < 3:
-        raise ValueError(f"{path}: need at least date, pressure and cumulative gas")
+        raise ValueError("need at least three columns: date, pressure, cumulative gas")
+
+    date_c = find_date_column(df)
+    cols = [c for c in df.columns if c != date_c]
+    if len(cols) < 2:
+        raise ValueError("need a pressure column and a cumulative gas column")
+
+    num = lambda c: pd.to_numeric(                                      # noqa: E731
+        df[c].astype(str).str.replace(",", "", regex=False).str.strip(), errors="coerce")
+
     out = pd.DataFrame({
-        "date": pd.to_datetime(df.iloc[:, 0]),
-        "P": pd.to_numeric(df.iloc[:, 1], errors="coerce"),
-        "Gp": pd.to_numeric(df.iloc[:, 2], errors="coerce"),
+        "date": (pd.to_datetime(df[date_c], errors="coerce", format="mixed")
+                 if date_c is not None else pd.NaT),
+        "P": num(cols[0]),
+        "Gp": num(cols[1]),
     })
-    out["condensate"] = pd.to_numeric(df.iloc[:, 3], errors="coerce").fillna(0.0) if df.shape[1] > 3 else 0.0
-    out["water"] = pd.to_numeric(df.iloc[:, 4], errors="coerce").fillna(0.0) if df.shape[1] > 4 else 0.0
-    return out.dropna(subset=["P", "Gp"]).sort_values("Gp").reset_index(drop=True)
+    out["condensate"] = num(cols[2]).fillna(0.0) if len(cols) > 2 else 0.0
+    out["water"] = num(cols[3]).fillna(0.0) if len(cols) > 3 else 0.0
+    out = out.dropna(subset=["P", "Gp"])
+    if len(out) < 3:
+        raise ValueError(f"only {len(out)} usable surveys -- need at least 3")
+    return out.sort_values("Gp").reset_index(drop=True)
 
 
 # ----------------------------------------------------------------------------
