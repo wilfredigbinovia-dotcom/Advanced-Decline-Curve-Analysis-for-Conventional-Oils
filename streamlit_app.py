@@ -17,17 +17,45 @@ import glob
 import io
 import math
 import os
+import sys
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-import dca
-from dca import MODELS
+HERE = os.path.dirname(os.path.abspath(__file__))
+if HERE not in sys.path:                    # the app's own folder, for `import dca`
+    sys.path.insert(0, HERE)
 
 st.set_page_config(page_title="Decline Curve Workbench", page_icon="📉",
                    layout="wide", initial_sidebar_state="expanded")
+
+try:
+    import dca
+    from dca import MODELS
+except ModuleNotFoundError as exc:
+    # A deployment problem, not a code problem: dca.py has to sit next to this file.
+    # Streamlit Cloud redacts the real traceback, so spell it out here instead.
+    if exc.name != "dca":
+        raise
+    listing = "\n".join(sorted(os.listdir(HERE))[:40]) or "(empty)"
+    st.error("**`dca.py` is missing.**")
+    st.markdown(
+        "`streamlit_app.py` is only the user interface — every calculation lives in "
+        "`dca.py`, which has to sit **in the same folder**.\n\n"
+        f"This app is running from `{HERE}`, which contains:\n\n"
+        f"```\n{listing}\n```\n\n"
+        "Push `dca.py` to the repository root, next to `streamlit_app.py`. The "
+        "repository needs at minimum:\n\n"
+        "```\n"
+        "streamlit_app.py      this file\n"
+        "dca.py                all the mathematics\n"
+        "requirements.txt      numpy, scipy, pandas, streamlit, plotly\n"
+        "data/                 the sample CSVs (optional — you can upload instead)\n"
+        "```\n\n"
+        "Streamlit Cloud redeploys automatically once the file is pushed.")
+    st.stop()
 
 SERIES_COLOURS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100",
                   "#e87ba4", "#4a3aa7", "#e34948"]
@@ -122,8 +150,15 @@ samples = sorted(p for p in glob.glob(os.path.join(DATA_DIR, "*.csv"))
                  if "pressure" not in os.path.basename(p))
 sample_names = [os.path.basename(p) for p in samples]
 
-source = st.sidebar.radio("Production data", ["Sample well", "Upload CSV"],
-                          horizontal=True, key="source")
+# The sample CSVs are optional. Without a data/ folder the app still works -- it just
+# has nothing to show until something is uploaded, so don't offer a dead choice.
+if sample_names:
+    source = st.sidebar.radio("Production data", ["Sample well", "Upload CSV"],
+                              horizontal=True, key="source")
+else:
+    source = "Upload CSV"
+    st.sidebar.caption("No `data/` folder found, so there are no sample wells. "
+                       "Upload a CSV to get started.")
 
 raw = None
 if source == "Upload CSV":
@@ -132,9 +167,12 @@ if source == "Upload CSV":
         help="Date, Days On, Oil (bbl), Gas (Mcf), Water (bbl). "
              "Period VOLUMES, not rates. Omit zero months — the date gaps carry them.")
     if up is None:
-        st.info("Upload a monthly production CSV, or switch to a sample well in the sidebar.\n\n"
-                "Expected columns: `Date`, `Days On`, and at least one of `Oil (bbl)` / "
-                "`Gas (Mcf)`, optionally `Water (bbl)`.")
+        st.info(
+            ("Upload a monthly production CSV, or switch to a sample well in the sidebar."
+             if sample_names else "Upload a monthly production CSV to get started.")
+            + "\n\nExpected columns: `Date`, `Days On`, and at least one of `Oil (bbl)` / "
+              "`Gas (Mcf)`, optionally `Water (bbl)`. Give it period **volumes**, not "
+              "rates, and leave zero months out — the date gaps carry the shut-ins.")
         st.stop()
     raw = up.getvalue()
     src_label = up.name
@@ -658,8 +696,8 @@ with tab_m:
                "Needs static pressure surveys against cumulative production.")
 
     pres = sorted(glob.glob(os.path.join(DATA_DIR, "*pressure*.csv")))
-    mb_src = st.radio("Pressure data", ["Sample reservoir", "Upload CSV"],
-                      horizontal=True, key="mb_src")
+    mb_src = (st.radio("Pressure data", ["Sample reservoir", "Upload CSV"],
+                       horizontal=True, key="mb_src") if pres else "Upload CSV")
     if mb_src == "Upload CSV":
         mup = st.file_uploader(
             "Pressure CSV", type="csv", key="mbup",
