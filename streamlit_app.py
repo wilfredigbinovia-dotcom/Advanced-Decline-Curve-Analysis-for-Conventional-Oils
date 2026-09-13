@@ -129,13 +129,14 @@ def _mb(P: tuple, Gp: tuple, cond: tuple, water: tuple, temp: float, sg: float,
 
 @st.cache_data(show_spinner=False)
 def _read_csv(src, name: str, column: str | None, days: str | None, date: str | None,
-              fluid: str, vfactor: float):
+              fluid: str, vfactor: float, cumulative: bool | None):
     # src is a path, upload bytes (csv or a workbook), or pasted text -- read_table
     # works out which. vfactor is the ONE place metric input becomes field units.
     src = io.BytesIO(src) if isinstance(src, bytes) else src
     return dca.load_frame(dca.read_table(src), column=column, days_column=days,
                           date_column=date, label=name, fluid=fluid,
-                          volume_factor=vfactor, water_factor=vfactor)
+                          volume_factor=vfactor, water_factor=vfactor,
+                          cumulative=cumulative)
 
 
 # Oilfield volume prefixes, which are not SI: for liquids M = thousand and
@@ -241,6 +242,15 @@ in_name = fc2.radio("Data is in", ["Field", "Metric"], key="unit_system",
                     help="What YOUR NUMBERS mean. Field: bbl, Mcf, psia, °F. "
                          "Metric: m³, 10³m³, kPa, °C. Get this wrong and every volume "
                          "is out by a factor of 6.3.")
+basis = st.sidebar.radio(
+    "Volumes are", ["Detect", "Per period", "Cumulative"], key="vol_basis",
+    horizontal=True,
+    help="Per period: each row is that month's own volume. Cumulative: each row is "
+         "everything produced up to and including that month, so the app differences "
+         "them. Summing a cumulative column is meaningless — 16.5 Bcf of running total "
+         "adds up to 582 Bcf.")
+CUM_IN = {"Detect": None, "Per period": False, "Cumulative": True}[basis]
+
 out_name = st.sidebar.radio("Show results in", ["Same as data", "Field", "Metric"],
                             key="unit_out", horizontal=True,
                             help="Reading and reporting are separate choices — field-unit "
@@ -316,7 +326,8 @@ st.session_state["_unit_sig"] = _sig
 st.sidebar.divider()
 
 
-samples = sorted(p for p in glob.glob(os.path.join(DATA_DIR, "*.csv"))
+samples = sorted(p for pat in ("*.csv", "*.tsv", "*.txt")
+                 for p in glob.glob(os.path.join(DATA_DIR, pat))
                  if "pressure" not in os.path.basename(p))
 sample_names = [os.path.basename(p) for p in samples]
 
@@ -368,8 +379,14 @@ if source == "Paste":
         f"**{fluid.lower()} in {VUNIT} · water in {UIN.oil} · monthly volumes, not rates**"
         + ("" if UIN.name == "field" else "  — reading as metric, per the sidebar"))
 
+    # The key carries a nonce. Deleting a data_editor's key does not clear it --
+    # the edits live in the frontend and are replayed onto whatever frame is passed
+    # in. Bumping the key builds a genuinely new widget, which is the only reliable
+    # way to empty it.
+    gnonce = st.session_state.get("grid_nonce", 0)
     grid = st.data_editor(
-        template, key="paste_grid", num_rows="dynamic", width="stretch", height=460,
+        template, key=f"paste_grid_{gnonce}", num_rows="dynamic", width="stretch",
+        height=460,
         column_config={
             "Date": st.column_config.TextColumn(
                 "Date", help="Any recognisable format: 2018-06-01, 06/01/2018, "
@@ -394,7 +411,8 @@ if source == "Paste":
     tc1.caption(f"**{len(filled)}** row{'' if len(filled) == 1 else 's'} with a date and a "
                 "volume. Five is the minimum to fit.")
     if tc2.button("Clear the table", use_container_width=True):
-        st.session_state.pop("paste_grid", None)
+        st.session_state["grid_nonce"] = gnonce + 1
+        st.session_state.pop(f"paste_grid_{gnonce}", None)
         st.rerun()
 
     with st.expander("Paste as text instead"):
@@ -481,7 +499,7 @@ if guess_days is None and days_col is None:
 
 try:
     s_full = _read_csv(raw, src_label, col, days_col, date_col,
-                       fluid.lower(), VIN)
+                       fluid.lower(), VIN, CUM_IN)
 except (ValueError, FileNotFoundError) as e:
     st.error(f"**Could not use that data.** {e}")
     st.markdown(PASTE_HELP)
@@ -708,6 +726,22 @@ st.caption(
 # before the tabs so the Forecast tab and the In-place tab show the same thing.
 wv = dca.WellVolumes(in_place=in_place, cum=cum_to_date, eur=primary["eur"].eur,
                      unit=unit, max_rf_pct=max_rf, source=ip_source)
+
+# Two readings the loader had to make on its own. Both are silent killers when
+# wrong -- a cumulative column summed, or DD/MM read as MM/DD -- so neither is
+# allowed to stay implicit.
+if s_full.cumulative_input:
+    st.info(
+        f"**Read as a running total.** The {s.column!r} column never falls, so each row "
+        "is being treated as everything produced up to that month and differenced into "
+        f"monthly volumes. Cumulative to date is **{vol(cum_to_date)}** — the last figure "
+        "in the column, not the sum of it. Set **Volumes are** in the sidebar to "
+        "*Per period* if that is wrong.")
+if s_full.dayfirst:
+    st.caption(
+        f"Dates read as **day-first** (DD/MM/YYYY), giving {s_full.dates.iloc[0]:%b %Y} to "
+        f"{s_full.dates.iloc[-1]:%b %Y} across {len(s_full.t)} months. Read the other way "
+        "these month-starts would collapse into a handful of Januaries.")
 
 tab_f, tab_d, tab_w, tab_v, tab_m, tab_t = st.tabs(
     ["Forecast", "Diagnostics", "Water", "In place", "Material balance", "Data"])
@@ -1250,7 +1284,8 @@ with tab_m:
                "the reservoir's — useful, but not something a single-well forecast can be "
                "checked against.")
 
-    pres = sorted(glob.glob(os.path.join(DATA_DIR, "*pressure*.csv")))
+    pres = sorted(p for pat in ("*pressure*.csv", "*pressure*.tsv")
+                  for p in glob.glob(os.path.join(DATA_DIR, pat)))
     MB_MODES = (["Sample reservoir"] if pres else []) + ["Paste", "Upload"]
     mb_src = st.radio("Pressure data", MB_MODES, horizontal=True, key="mb_src")
 

@@ -39,6 +39,7 @@ import io
 import math
 import os
 import sys
+import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Dict, List, Optional, Sequence
 
@@ -61,6 +62,7 @@ __all__ = [
     "movable_volume_from_decline", "MovableVolume", "WellVolumes",
     "load_csv", "load_pressure_csv", "read_table", "load_frame",
     "find_date_column", "find_days_column", "find_production_columns",
+    "parse_dates", "looks_cumulative", "to_period_volumes",
 ]
 
 DPM = 30.4375  # days per average month
@@ -1640,6 +1642,8 @@ class Series:
     is_gas: bool
     water: Optional[np.ndarray] = None
     frame: Optional[pd.DataFrame] = field(default=None, repr=False)
+    cumulative_input: bool = False      # the source column was a running total
+    dayfirst: bool = False              # dates were read as DD/MM rather than MM/DD
 
     @property
     def unit(self) -> str:
@@ -1776,8 +1780,12 @@ def read_table(source) -> pd.DataFrame:
             looks_like_path = ("\n" not in source and "\t" not in source
                                and (os.path.exists(source) or len(source) < 260))
             if looks_like_path and os.path.exists(source):
-                df = pd.read_csv(source)
-                text = None
+                # Read the file and sniff it like any other text. Handing the path
+                # straight to read_csv assumes commas, which silently makes a
+                # tab-separated file one column wide -- and an upload of the SAME
+                # file, arriving as bytes, would have been sniffed and read fine.
+                with open(source, "rb") as fh:
+                    text = fh.read().decode("utf-8-sig", errors="replace")
             elif looks_like_path and "\n" not in source and os.sep in source:
                 raise FileNotFoundError(f"no such file: {source}")
             else:
@@ -1804,7 +1812,7 @@ def read_table(source) -> pd.DataFrame:
                     "spreadsheet (which gives tab-separated columns), or as "
                     "comma-separated values, with one row per month.")
         elif "df" not in dir():
-            df = pd.read_csv(source)
+            df = pd.read_csv(source)          # unreachable in practice; a safety net
 
     df.columns = [str(c).strip() for c in df.columns]
 
@@ -1829,6 +1837,52 @@ def read_table(source) -> pd.DataFrame:
         df.columns = ["Date"] + [f"Column {i}" for i in range(2, df.shape[1] + 1)]
 
     return df.dropna(how="all").reset_index(drop=True)
+
+
+def parse_dates(series) -> tuple:
+    """Parse a date column, working out day-first vs month-first from the data.
+
+    `01/07/2020` is 1 July outside the US and 7 January inside it, and nothing in
+    the string says which. Guessing wrong is not a small error: a column of
+    month-starts in DD/MM/YYYY read as MM/DD/YYYY collapses to a handful of
+    Januaries -- 74 monthly records became 7 distinct months on the well that
+    prompted this -- and the whole month clock, and every decline rate on it,
+    is then fiction.
+
+    The SEQUENCE disambiguates what the strings cannot. A real monthly history
+    is strictly increasing and hits each month once, so both readings are tried
+    and scored on how many distinct months they yield and how much of the series
+    runs forwards. Ties go to month-first, which is what ISO dates and US data
+    both want.
+
+    Returns (parsed, dayfirst_used).
+    """
+    s = pd.Series(series).astype(str).str.strip()
+
+    def attempt(dayfirst: bool):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            try:
+                d = pd.to_datetime(s, errors="coerce", dayfirst=dayfirst, format="mixed")
+            except (ValueError, TypeError):
+                return None, -1.0
+        good = d.notna()
+        if good.sum() < 2:
+            return d, -1.0
+        v = d[good]
+        months = (v.dt.year * 12 + v.dt.month).to_numpy()
+        forward = float(np.mean(np.diff(months) > 0)) if months.size > 1 else 0.0
+        distinct = len(set(months)) / months.size
+        parsed = float(good.mean())
+        # Parsing at all matters most, then distinct months, then direction.
+        return d, 2.0 * parsed + 1.5 * distinct + 1.0 * forward
+
+    d_month, score_month = attempt(False)
+    d_day, score_day = attempt(True)
+
+    if score_day > score_month + 1e-9:
+        return d_day, True
+    return d_month, False
 
 
 def find_date_column(df: pd.DataFrame) -> Optional[str]:
@@ -1918,14 +1972,56 @@ def find_days_column(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
+def looks_cumulative(values) -> bool:
+    """Is this column a running total rather than a per-period volume?
+
+    Plenty of production reports carry cumulatives -- the month's figure is
+    everything produced up to and including that month -- and summing them
+    gives a number with no physical meaning at all. On the well that prompted
+    this, 16.5 Bcf of cumulative gas summed to 582 Bcf, and the forecast that
+    followed was in Tcf.
+
+    The signature is a series that never falls. A per-period volume falls
+    constantly; a running total cannot fall at all, bar the odd restatement.
+    Growth is required as well, so a well sitting on a flat plateau -- whose
+    period volumes also barely change -- is not mistaken for one.
+
+    Deliberately conservative, and never the last word: the caller states what
+    it decided and offers the override, because there is no test that separates
+    a cumulative series from a short monotonic ramp-up with certainty.
+    """
+    v = np.asarray(values, dtype=float)
+    v = v[np.isfinite(v)]
+    if v.size < 8:
+        return False
+    d = np.diff(v)
+    scale = float(np.max(np.abs(v))) or 1.0
+    never_falls = float(np.mean(d >= -1e-9 * scale)) >= 0.98
+    grows = float(v[-1]) >= 3.0 * max(float(v[0]), 1e-12)
+    return bool(never_falls and grows)
+
+
+def to_period_volumes(values):
+    """Running total -> per-period volumes.
+
+    The first period is taken as the first cumulative figure itself, i.e.
+    nothing was produced before the record starts. If the record begins
+    mid-life that overstates the first period; it does not touch any other.
+    """
+    v = np.asarray(values, dtype=float)
+    return np.diff(v, prepend=0.0)
+
+
 def load_frame(df: pd.DataFrame, column: Optional[str] = None,
                days_column: Optional[str] = "Days On",
                date_column: Optional[str] = None, label: str = "data",
                fluid: Optional[str] = None, volume_factor: float = 1.0,
-               water_factor: float = 1.0) -> Series:
+               water_factor: float = 1.0,
+               cumulative: Optional[bool] = None,
+               dayfirst: Optional[bool] = None) -> Series:
     """Build a Series from an already-read table.
 
-    Two things this does that a naive reader does not:
+    Three things this does that a naive reader does not:
 
     1. TIME COMES FROM THE DATES, not the row order. Zero-production months are
        normally omitted, so the date gaps ARE the shut-ins. Counting rows would
@@ -1935,6 +2031,14 @@ def load_frame(df: pd.DataFrame, column: Optional[str] = None,
        reported rate straight in inherits whatever uptime convention the source
        used -- and calendar-day and operated-day rates differ by the uptime
        fraction, which is how downtime gets mistaken for decline.
+
+    3. A column that never falls is read as a RUNNING TOTAL and differenced.
+       Summing a cumulative column produces a number with no meaning: on the
+       well that prompted this, 16.5 Bcf of cumulative gas summed to 582 Bcf.
+       Pass `cumulative=True/False` to override the detection.
+
+    `dayfirst` likewise overrides the DD/MM vs MM/DD detection. Both choices
+    are recorded on the returned Series so the caller can state them.
     """
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
@@ -1950,7 +2054,15 @@ def load_frame(df: pd.DataFrame, column: Optional[str] = None,
     if column is None or column not in df.columns:
         raise ValueError(f"no production column found in {label}: {list(df.columns)}")
 
-    dates = pd.to_datetime(df[date_column], errors="coerce", format="mixed")
+    if dayfirst is None:
+        dates, dayfirst_used = parse_dates(df[date_column])
+    else:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            dates = pd.to_datetime(df[date_column], errors="coerce",
+                                   dayfirst=bool(dayfirst), format="mixed")
+        dayfirst_used = bool(dayfirst)
+
     vol = _numeric(df[column])
 
     if not days_column or days_column not in df.columns:
@@ -1960,25 +2072,58 @@ def load_frame(df: pd.DataFrame, column: Optional[str] = None,
     else:
         days = pd.Series(DPM, index=df.index)   # no uptime column: calendar days
 
-    ok = dates.notna() & vol.notna() & (vol > 0) & days.notna() & (days > 0)
-    if ok.sum() < 5:
-        raise ValueError(
-            f"only {int(ok.sum())} usable periods in {label} -- need at least 5 rows "
-            f"with a valid date and a positive {column!r}")
-
-    df, dates, vol, days = (df[ok].reset_index(drop=True), dates[ok].reset_index(drop=True),
-                            vol[ok].to_numpy(), days[ok].to_numpy())
-    order = np.argsort((dates.dt.year * 12 + dates.dt.month).to_numpy(), kind="stable")
-    dates, vol, days = dates.iloc[order].reset_index(drop=True), vol[order], days[order]
-
-    months = (dates.dt.year * 12 + dates.dt.month).to_numpy()
-    t = (months - months[0]).astype(float) + 0.5
-
     water = None
     for c in df.columns:
         if str(c).lower().startswith("water"):
-            water = _numeric(df[c]).fillna(0.0).to_numpy()[order]
+            water = _numeric(df[c])
             break
+
+    # Keep every row that has a date and a readable volume. The volume > 0 test
+    # comes AFTER differencing, because a cumulative column that holds steady
+    # across a shut-in month is a legitimate row whose period volume is zero.
+    ok = dates.notna() & vol.notna() & days.notna() & (days >= 0)
+    if ok.sum() < 5:
+        raise ValueError(
+            f"only {int(ok.sum())} usable periods in {label} -- need at least 5 rows "
+            f"with a valid date and a readable {column!r}")
+
+    df = df[ok].reset_index(drop=True)
+    dates = dates[ok].reset_index(drop=True)
+    vol = vol[ok].to_numpy()
+    days = days[ok].to_numpy()
+    if water is not None:
+        water = water[ok].fillna(0.0).to_numpy()
+
+    # Chronological order first: differencing a running total is meaningless
+    # against any other ordering.
+    order = np.argsort((dates.dt.year * 12 + dates.dt.month).to_numpy(), kind="stable")
+    dates = dates.iloc[order].reset_index(drop=True)
+    df = df.iloc[order].reset_index(drop=True)
+    vol, days = vol[order], days[order]
+    if water is not None:
+        water = water[order]
+
+    cum_in = looks_cumulative(vol) if cumulative is None else bool(cumulative)
+    if cum_in:
+        vol = to_period_volumes(vol)
+        # Water is judged on its own: a report can carry cumulative gas beside
+        # per-period water, and assuming they match would corrupt the WOR.
+        if water is not None and (looks_cumulative(water) if cumulative is None else True):
+            water = to_period_volumes(water)
+
+    keep = np.isfinite(vol) & (vol > 0) & (days > 0)
+    if keep.sum() < 5:
+        raise ValueError(
+            f"only {int(keep.sum())} periods in {label} have a positive {column!r} and "
+            "producing days" + (" after differencing the running total" if cum_in else ""))
+    dates = dates[keep].reset_index(drop=True)
+    df = df[keep].reset_index(drop=True)
+    vol, days = vol[keep], days[keep]
+    if water is not None:
+        water = np.maximum(water[keep], 0.0)
+
+    months = (dates.dt.year * 12 + dates.dt.month).to_numpy()
+    t = (months - months[0]).astype(float) + 0.5
 
     # Fluid is declared, not guessed, when the caller says so. Guessing from the
     # column name works for "Gas (Mcf)" and fails for "Sales volume".
@@ -1999,14 +2144,16 @@ def load_frame(df: pd.DataFrame, column: Optional[str] = None,
 
     return Series(t=t, q=vol / days, volume=vol, days=days, dates=dates,
                   cum=np.cumsum(vol), column=column,
-                  is_gas=is_gas, water=water, frame=df)
+                  is_gas=is_gas, water=water, frame=df,
+                  cumulative_input=cum_in, dayfirst=dayfirst_used)
 
 
 def load_csv(path, column: Optional[str] = None,
              days_column: Optional[str] = "Days On",
              date_column: Optional[str] = None,
              fluid: Optional[str] = None, volume_factor: float = 1.0,
-             water_factor: float = 1.0) -> Series:
+             water_factor: float = 1.0, cumulative: Optional[bool] = None,
+             dayfirst: Optional[bool] = None) -> Series:
     """Read a monthly production table into a Series.
 
         Date,Days On,Oil (bbl),Gas (Mcf),Water (bbl)
@@ -2018,7 +2165,8 @@ def load_csv(path, column: Optional[str] = None,
     label = path if isinstance(path, str) and "\n" not in path else "the pasted data"
     return load_frame(read_table(path), column=column, days_column=days_column,
                       date_column=date_column, label=str(label), fluid=fluid,
-                      volume_factor=volume_factor, water_factor=water_factor)
+                      volume_factor=volume_factor, water_factor=water_factor,
+                      cumulative=cumulative, dayfirst=dayfirst)
 
 
 def load_pressure_csv(source) -> pd.DataFrame:
