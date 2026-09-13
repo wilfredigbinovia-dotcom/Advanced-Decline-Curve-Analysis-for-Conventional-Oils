@@ -554,13 +554,17 @@ st.sidebar.caption(
     "The volume **this well** is connected to, not the reservoir's total. A single-well "
     "forecast can only be checked against a single-well volume.")
 
-IP_ROUTES = ["Off", "Enter it", "Volumetric", "From the decline"]
-ip_route = st.sidebar.radio("How to get it", IP_ROUTES, key="ip_route",
-                            help="Material balance is on its own tab — it has a button to "
-                                 "send its answer here.")
+# A value sent over from the Material balance tab OVERRIDES the route below, and is
+# not written back into the radio. Streamlit forbids setting a widget's key after the
+# widget has been created in that run -- the buttons on the MB tab run long after this
+# radio does -- so the hand-off carries its own state and wins on its own.
+MB_VALUE = st.session_state.get("ip_from_mb")
 
-# A value sent over from the Material balance tab wins until the route is changed.
-if st.session_state.get("ip_from_mb") and ip_route == "Off":
+IP_ROUTES = ["Off", "Enter it", "Volumetric", "From the decline"]
+ip_route = st.sidebar.radio(
+    "How to get it", IP_ROUTES, key="ip_route", disabled=MB_VALUE is not None,
+    help="Material balance is on its own tab — it has a button to send its answer here.")
+if MB_VALUE is not None:
     ip_route = "From material balance"
 
 in_place = None
@@ -638,11 +642,13 @@ elif ip_route == "From the decline":
                                "form a line, so this intercept is not meaningful.")
 
 elif ip_route == "From material balance":
-    in_place = st.session_state.get("ip_from_mb")
+    in_place = MB_VALUE
     ip_source = st.session_state.get("ip_from_mb_src", "material balance")
-    st.sidebar.success(f"Using {vol(in_place)} from the Material balance tab.")
-    if st.sidebar.button("Clear it"):
+    st.sidebar.success(f"Using **{vol(in_place)}** from the Material balance tab. "
+                       "The routes above are switched off while it is in use.")
+    if st.sidebar.button("Clear it and choose another route"):
         st.session_state.pop("ip_from_mb", None)
+        st.session_state.pop("ip_from_mb_src", None)
         st.rerun()
 
 DEFAULT_RF = {"gas_vol": 85.0, "gas_wd": 60.0, "oil": 30.0}
@@ -1409,12 +1415,16 @@ with tab_m:
                                  "F_over_Et": "F/Et (STB)"})
                 .style.format("{:,.4g}"), width="stretch", hide_index=True)
 
+            oil_mismatch = IS_GAS
+            if oil_mismatch:
+                st.caption("⚠️ The well is set to **gas** in the sidebar but this is an "
+                           "**oil** balance, so the answer cannot be sent across — it "
+                           "would land in the wrong units.")
             if st.button(f"Use {liq(omb.stoiip)} as this well's STOIIP",
-                         type="primary", key="send_oil"):
+                         type="primary", key="send_oil", disabled=oil_mismatch):
                 st.session_state["ip_from_mb"] = omb.stoiip
                 st.session_state["ip_from_mb_src"] = (
                     f"oil material balance · R² {omb.r2:.3f} · {omb.drive}")
-                st.session_state["ip_route"] = "Off"
                 st.rerun()
             st.caption("Sends it to the sidebar, where it becomes the in-place volume the "
                        "forecast is checked against. Only meaningful if these pressures and "
@@ -1559,24 +1569,31 @@ with tab_m:
                                                   "J_bbl_d_psi": "{:g}", "rms_pct": "{:.1f}"}),
                          width="stretch", hide_index=True)
 
+            # The hand-off must not cross fluids: a gas volume dropped into an oil
+            # in-place slot is formatted in bbl and reads as a plausible number.
+            mismatch = (mb_fluid == "Gas") != IS_GAS
+            if mismatch:
+                st.caption(f"⚠️ The well is set to **{fluid.lower()}** in the sidebar but "
+                           f"this balance is **{mb_fluid.lower()}**, so the answer cannot "
+                           "be sent across — it would land in the wrong units. Change the "
+                           "fluid in the sidebar if this is a gas well.")
             gcol = st.columns(2)
             if gcol[0].button(f"Use the Fetkovich G ({f['G_Bcf']:,.0f} Bcf) as this well's "
-                              "GIIP", key="send_fetk"):
+                              "GIIP", key="send_fetk", disabled=mismatch):
                 st.session_state["ip_from_mb"] = f["G_Bcf"] * 1e6      # Bcf -> Mcf
                 st.session_state["ip_from_mb_src"] = (
                     f"Fetkovich aquifer fit · G {f['G_Bcf']:,.0f} Bcf · rms {f['rms_pct']:.1f}%")
-                st.session_state["ip_route"] = "Off"
                 st.rerun()
             if gcol[1].button(f"Use the p/z intercept ({r.ogip_pz / 1000:,.0f} Bcf) instead",
                               key="send_pz",
-                              disabled=not r.volumetric,
-                              help=None if r.volumetric else
-                              "Disabled: F/Eg is rising, so the p/z intercept is an artefact "
-                              "rather than a volume."):
+                              disabled=mismatch or not r.volumetric,
+                              help="Disabled: the sidebar fluid is oil." if mismatch
+                              else (None if r.volumetric else
+                                    "Disabled: F/Eg is rising, so the p/z intercept is an "
+                                    "artefact rather than a volume.")):
                 st.session_state["ip_from_mb"] = r.ogip_pz * 1000.0    # MMscf -> Mcf
                 st.session_state["ip_from_mb_src"] = (
                     f"p/z intercept · {r.ogip_pz / 1000:,.0f} Bcf · R² {r.r2:.4f}")
-                st.session_state["ip_route"] = "Off"
                 st.rerun()
             st.caption("Either number becomes the in-place volume the forecast is checked "
                        "against. It is only a **well** volume if these pressures and this "
