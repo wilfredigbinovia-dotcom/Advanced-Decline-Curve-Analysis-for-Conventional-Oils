@@ -57,7 +57,8 @@ __all__ = [
     "loss_ratio_b", "loglog_slope", "find_plateau", "extrapolation_multiple",
     "wor_analysis", "chan_derivative",
     "z_factor", "material_balance", "fetkovich_fit",
-    "volumetric_oil_in_place", "volumetric_gas_in_place", "gas_fvf", "oil_fvf",
+    "volumetric_oil_in_place", "volumetric_gas_in_place", "net_pay_from_interval",
+    "gas_fvf", "oil_fvf",
     "standing_rs", "standing_bo", "oil_material_balance", "OilMBResult",
     "movable_volume_from_decline", "MovableVolume", "WellVolumes",
     "load_csv", "load_pressure_csv", "read_table", "load_frame",
@@ -1503,6 +1504,31 @@ def flowing_bhp(p_tf_psia: float, q_mscfd: float, depth_ft: float,
             return pn
         p = pn
     return p
+
+
+def net_pay_from_interval(top_ft: float, base_ft: float, ntg: float) -> float:
+    """Net pay from the reservoir interval and a net-to-gross ratio.
+
+        gross = base - top          net = gross * NTG
+
+    Net pay is the number the volumetric equation wants, but it is often the
+    number nobody has written down: what the geologist hands over is a top, a
+    base and an NTG off the log suite. This does that multiplication in one
+    place so it is done once and can be tested.
+
+    Depths are TRUE VERTICAL, and both must be on the same reference -- two
+    subsea depths, or two along-hole depths from the same datum. Mixing a
+    subsea top with a driller's base is the mistake this cannot catch, because
+    the arithmetic works and only the answer is wrong.
+    """
+    if not 0.0 < ntg <= 1.0:
+        raise ValueError(f"net-to-gross must be a fraction above 0 and at most 1, got {ntg}")
+    gross = base_ft - top_ft
+    if gross <= 0:
+        raise ValueError(
+            f"base must be deeper than top: got top {top_ft:,.6g} and base {base_ft:,.6g}. "
+            "Both should be true vertical depths on the same reference, increasing downward")
+    return gross * ntg
 
 
 def volumetric_gas_in_place(area_acres: float, net_pay_ft: float, porosity: float,

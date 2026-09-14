@@ -278,7 +278,8 @@ WELL_LABEL = " · ".join(label_bits) if label_bits else ""
 # the new system.
 _UNIT_WIDGETS = {
     "qab": "rate", "ip_direct": "volume",
-    "v_area": "area", "v_pay": "length", "v_pi": "pressure", "v_t": "temperature",
+    "v_area": "area", "v_pay": "length", "v_top": "length", "v_base": "length",
+    "v_pi": "pressure", "v_t": "temperature",
     "mb_t": "temperature", "mb_pab": "pressure", "omb_t": "temperature",
     "omb_pb": "pressure", "mb_depth": "length", "mb_twh": "temperature",
 }
@@ -603,16 +604,69 @@ if ip_route == "Enter it":
 
 elif ip_route == "Volumetric":
     st.sidebar.caption("Drainage area for **this well**, not the field.")
-    c1, c2 = st.sidebar.columns(2)
-    area_d = unum(c1, f"Drainage area ({U.area})", "v_area", 160.0 / U.area_to_acre,
+    area_d = unum(st.sidebar, f"Drainage area ({U.area})", "v_area", 160.0 / U.area_to_acre,
                   min_value=0.01, max_value=1e6, step=10.0, format="%.4g")
-    pay_d = unum(c2, f"Net pay ({U.length})", "v_pay", 50.0 / U.length_to_ft,
-                 min_value=0.01, max_value=2e4, step=5.0, format="%.4g")
-    area, pay = area_d * U.area_to_acre, pay_d * U.length_to_ft
+    area = area_d * U.area_to_acre
+
+    # Net pay two ways, and only one of them live at a time. Streamlit reruns the
+    # whole script on every keystroke, so reading the other group out of session
+    # state before building this one is enough to decide what to grey out. Zero
+    # is the "not entered" value in both directions -- a real net pay is never 0,
+    # and neither is a real gross interval.
+    _pay_set = float(st.session_state.get("v_pay", 0.0) or 0.0) > 0
+    _top = float(st.session_state.get("v_top", 0.0) or 0.0)
+    _base = float(st.session_state.get("v_base", 0.0) or 0.0)
+    _interval_set = _base > _top > 0
+
+    c2a, c2b = st.sidebar.columns([1, 1])
+    # Asymmetric on purpose. If both somehow hold values -- restored session
+    # state, or a default changing under an old key -- disabling both leaves no
+    # box the user can edit to escape. Net pay wins and stays editable, so
+    # clearing it always re-opens the interval.
+    pay_d = unum(c2a, f"Net pay ({U.length})", "v_pay", 0.0,
+                 min_value=0.0, max_value=2e4, step=5.0, format="%.4g",
+                 disabled=_interval_set and not _pay_set,
+                 help="Leave at 0 to build it from the interval instead.")
+    c2b.markdown("<div style='padding-top:1.9rem;color:#7e8286;font-size:.8rem'>"
+                 "or ↓</div>", unsafe_allow_html=True)
+
+    c7, c8, c9 = st.sidebar.columns(3)
+    top_d = unum(c7, f"Top ({U.length})", "v_top", 0.0, min_value=0.0, max_value=6e4,
+                 step=10.0, format="%.6g", disabled=_pay_set,
+                 help="True vertical depth to the top of the reservoir.")
+    base_d = unum(c8, f"Base ({U.length})", "v_base", 0.0, min_value=0.0, max_value=6e4,
+                  step=10.0, format="%.6g", disabled=_pay_set,
+                  help="Same reference as the top — both subsea, or both along hole.")
+    ntg = c9.number_input("NTG", 0.01, 1.0, 1.0, step=0.05, key="v_ntg",
+                          disabled=_pay_set,
+                          help="Net-to-gross. Multiplies the gross interval to give net pay.")
+
+    pay_err = None
+    if _pay_set:
+        pay = pay_d * U.length_to_ft
+        st.sidebar.caption(f"Net pay **{pay_d:,.4g} {U.length}**, entered directly. "
+                           "Clear it to build net pay from the interval instead.")
+    elif base_d > 0 or top_d > 0:
+        try:
+            pay = dca.net_pay_from_interval(top_d * U.length_to_ft,
+                                            base_d * U.length_to_ft, ntg)
+            st.sidebar.caption(
+                f"Gross **{base_d - top_d:,.6g} {U.length}** × NTG {ntg:.0%} = net pay "
+                f"**{pay / U.length_to_ft:,.4g} {U.length}**. Enter a net pay above to "
+                "override this.")
+        except ValueError as e:
+            pay, pay_err = 0.0, str(e)
+    else:
+        pay, pay_err = 0.0, ("Enter a **net pay**, or a **top, base and NTG** to build one "
+                             "from the interval.")
+    if pay_err:
+        st.sidebar.info(pay_err) if pay <= 0 and "Enter a" in pay_err else st.sidebar.error(pay_err)
     c3, c4 = st.sidebar.columns(2)
     poro = c3.number_input("Porosity (frac)", 0.01, 0.60, 0.20, step=0.01, key="v_poro")
     swi = c4.number_input("Water sat. (frac)", 0.0, 0.95, 0.25, step=0.05, key="v_sw")
     try:
+        if pay <= 0:
+            raise ValueError("no net pay yet")
         if IS_GAS:
             c5, c6 = st.sidebar.columns(2)
             pi_d = unum(c5, f"Initial pressure ({U.pressure})", "v_pi",
@@ -639,7 +693,8 @@ elif ip_route == "Volumetric":
             ip_source = (f"volumetric · {area_d:,.4g} {U.area} × {pay_d:,.4g} {U.length} × "
                          f"{poro:.0%} φ × {1-swi:.0%} So ÷ Boi {boi:.2f}")
     except ValueError as e:
-        st.sidebar.error(str(e))
+        if str(e) != "no net pay yet":
+            st.sidebar.error(str(e))
 
 elif ip_route == "From the decline":
     mv_side = dca.movable_volume_from_decline(s.cum, s.q)
