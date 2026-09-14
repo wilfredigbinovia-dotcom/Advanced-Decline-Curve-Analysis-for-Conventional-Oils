@@ -799,8 +799,155 @@ if s_full.dayfirst:
         f"{s_full.dates.iloc[-1]:%b %Y} across {len(s_full.t)} months. Read the other way "
         "these month-starts would collapse into a handful of Januaries.")
 
-tab_f, tab_d, tab_w, tab_v, tab_m, tab_t = st.tabs(
-    ["Forecast", "Diagnostics", "Water", "In place", "Material balance", "Data"])
+# Computed BEFORE the tabs, because the Summary tab needs it and Summary has to be
+# written before any block that can call st.stop() -- which halts the whole script,
+# not just its tab. The oil material balance hands off and stops; everything
+# appended after that never ran.
+band = None
+if nboot:
+    with st.spinner(f"Bootstrapping {nboot} replicates…"):
+        dist = _boot(primary_key, t_tup, q_tup, tuple(sorted(primary["fit"].p.items())),
+                     qab, nboot, horizon,
+                     dmin if primary_key == "modhyp" else None, seed)
+    band = dca.pxx(dist) if len(dist) else None
+shown_eur = primary["eur"].eur
+
+tab_s, tab_f, tab_d, tab_w, tab_v, tab_m, tab_t = st.tabs(
+    ["Summary", "Forecast", "Diagnostics", "Water", "In place", "Material balance", "Data"])
+# ---------------------------------------------------------------------------
+# Summary
+#
+# Written last, rendered first. Streamlit tab containers are positional, not
+# sequential, so this fills the tab declared at the top of the list using values
+# every other tab has already finished computing -- including the in-place volume
+# handed over from Material balance, which does not exist until that block runs.
+# ---------------------------------------------------------------------------
+
+with tab_s:
+    P = primary["fit"].p
+    # At the START OF THE FIT WINDOW, never at t = 0. For several models t = 0 is
+    # outside the fitted domain, and Duong has a pole there -- it reported 802
+    # Mcf/d against a well doing 10,300, and a decline of -1.5e187 %/yr.
+    fit_t0 = float(s.t[0])
+    q_initial = float(np.asarray(dca.rate(primary_key, P, fit_t0)).reshape(-1)[0])
+    d_initial = dca.effective_decline(primary_key, P, fit_t0)
+    d_now = dca.effective_decline(primary_key, P, float(s.t[-1]))
+    b_val = P.get("b")
+    # b is a property of the well, not of whichever model won AICc -- and Duong,
+    # PLE and SEPD carry none. The loss ratio gives one from the data either way,
+    # so it fills in when the model cannot and cross-checks when it can.
+    lr = _loss_ratio(t_tup, q_tup)
+    b_data = lr.b if (lr is not None and lr.reliable) else None
+    eur_val = band["P50"] if band else shown_eur
+    ip_label = "GIIP" if IS_GAS else "STOIIP"
+
+    title = " · ".join(label_bits) if label_bits else "This well"
+    st.subheader(title)
+    st.caption(
+        f"{fluid} · {len(s.t)} months in the fit window of {n_all} on file · "
+        f"{s_full.dates.iloc[0]:%b %Y} to {s_full.dates.iloc[-1]:%b %Y} · "
+        f"model **{MODELS[primary_key].name}**, R² {primary['fit'].r2:.4f}")
+
+    k = st.columns(4)
+    k[0].metric("Initial forecast rate", f"{dsp(q_initial):,.4g} {unit}/d",
+                help="The fitted curve at the start of the fit window, not the first "
+                     "row in the file and not extrapolated back to first production.")
+    if b_val is not None:
+        b_show, b_sub = f"{b_val:.2f}", (f"loss ratio {b_data:.2f}" if b_data is not None
+                                         else "loss ratio not determinable")
+    elif b_data is not None:
+        b_show, b_sub = f"{b_data:.2f}", "from the loss ratio; this model has no b"
+    else:
+        b_show, b_sub = "—", f"{MODELS[primary_key].name} has no b, and the loss ratio "
+        b_sub += "is not determinable"
+    k[1].metric("b", b_show, delta=b_sub, delta_color="off",
+                help="Arps shape parameter. Duong, PLE and SEPD carry none, so the "
+                     "loss-ratio estimate off the data stands in — and cross-checks the "
+                     "fitted value when there is one.")
+    def _decl(d):
+        # A negative effective decline is a rate that RISES over the year ahead.
+        # Printing it as "-394.5 %/yr" is arithmetically true and unreadable; the
+        # multiple is the same fact in a form someone can act on.
+        if not math.isfinite(d):
+            return "—"
+        return f"{100 * d:,.1f} %/yr" if d >= 0 else f"rising ×{1 - d:,.2f}"
+
+    k[2].metric("Initial decline", _decl(d_initial),
+                delta=f"now {_decl(d_now)}", delta_color="off",
+                help="Effective decline over the year ahead — 1 − q(t+12)/q(t), the "
+                     "reserves-report definition, taken at the start of the fit window.")
+    k[3].metric("Well life", f"{primary['eur'].years:.1f} yr")
+
+    k2 = st.columns(4)
+    k2[0].metric("Cumulative production", vol(cum_to_date))
+    k2[1].metric("Reserves (remaining)", vol(primary["remaining"]),
+                 help="From the end of the fit window to the abandonment rate.")
+    k2[2].metric("EUR" + (" — P50" if band else ""), vol(eur_val),
+                 delta=(f"P90 {vol(band['P90'])} · P10 {vol(band['P10'])}" if band else None),
+                 delta_color="off")
+    k2[3].metric(ip_label, vol(in_place) if in_place else "—",
+                 help="Set it in the sidebar, or hand one over from Material balance."
+                      if not in_place else None)
+
+    if math.isfinite(d_initial) and d_initial < 0:
+        st.warning(
+            f"**{MODELS[primary_key].name} forecasts a RISING rate** at the start of the "
+            f"fit window — ×{1 - d_initial:,.2f} over the first year. A decline "
+            "model that does not decline is fitting something other than depletion: "
+            "check the Diagnostics tab before any number on this page is used.")
+
+    # The reconciliation, not just the numbers. Four quantities that have to agree
+    # with each other, and the one line that says whether they do.
+    if in_place:
+        rf_now = 100.0 * cum_to_date / in_place
+        rf_eur = 100.0 * eur_val / in_place
+        st.markdown(
+            f"**Recovery.** {rf_now:,.1f}% of {ip_label} produced to date, "
+            f"{rf_eur:,.1f}% by end of life against a {max_rf:.0f}% ceiling.")
+        if wv.verdict:
+            (st.error if rf_eur > max_rf else st.success)(wv.verdict)
+    else:
+        mult, _v = dca.extrapolation_multiple(primary["remaining"], cum_to_date)
+        st.info(
+            f"**No {ip_label} set**, so nothing checks this forecast against the tank. "
+            f"The extrapolation multiple is {mult:.2f}× — "
+            + ("under 0.5×, so decline alone is defensible here."
+               if mult < 0.5 else
+               "at that level an independent volume is worth having."))
+
+    rows = [
+        ("Well", " · ".join(label_bits) if label_bits else ""),
+        ("Fluid", fluid),
+        ("Model", MODELS[primary_key].name),
+        ("Fit R2 (log q)", f"{primary['fit'].r2:.4f}"),
+        (f"Initial forecast rate ({unit}/d)", f"{dsp(q_initial):.6g}"),
+        ("b (fitted)", f"{b_val:.4f}" if b_val is not None else ""),
+        ("b (loss ratio)", f"{b_data:.4f}" if b_data is not None else ""),
+        ("Initial effective decline (%/yr)",
+         f"{100 * d_initial:.3f}" if math.isfinite(d_initial) else ""),
+        ("Current effective decline (%/yr)",
+         f"{100 * d_now:.3f}" if math.isfinite(d_now) else ""),
+        (f"Cumulative production ({unit})", f"{dsp(cum_to_date):.6g}"),
+        (f"Reserves, remaining ({unit})", f"{dsp(primary['remaining']):.6g}"),
+        (f"EUR ({unit})", f"{dsp(eur_val):.6g}"),
+        (f"EUR P90 ({unit})", f"{dsp(band['P90']):.6g}" if band else ""),
+        (f"EUR P10 ({unit})", f"{dsp(band['P10']):.6g}" if band else ""),
+        (f"{ip_label} ({unit})", f"{dsp(in_place):.6g}" if in_place else ""),
+        (f"{ip_label} basis", ip_source if in_place else ""),
+        ("Well life (yr)", f"{primary['eur'].years:.2f}"),
+        (f"Abandonment rate ({unit}/d)", f"{qab_disp:.6g}"),
+    ]
+    summary = pd.DataFrame(rows, columns=["Quantity", "Value"])
+    st.dataframe(summary, width="stretch", hide_index=True, height=420)
+    st.download_button(
+        "Download the summary as CSV", summary.to_csv(index=False).encode(),
+        file_name=(("_".join(b.replace(" ", "-") for b in label_bits) or "well")
+                   + "_summary.csv"),
+        mime="text/csv")
+    st.caption(
+        f"Volumes in {unit}, rates in {unit}/d. Every figure is the one shown on its own "
+        "tab — this page restates, it does not recompute.")
+
 
 
 # ---------------------------------------------------------------------------
@@ -808,15 +955,6 @@ tab_f, tab_d, tab_w, tab_v, tab_m, tab_t = st.tabs(
 # ---------------------------------------------------------------------------
 
 with tab_f:
-    band = None
-    if nboot:
-        with st.spinner(f"Bootstrapping {nboot} replicates…"):
-            dist = _boot(primary_key, t_tup, q_tup, tuple(sorted(primary["fit"].p.items())),
-                         qab, nboot, horizon,
-                         dmin if primary_key == "modhyp" else None, seed)
-        band = dca.pxx(dist) if len(dist) else None
-
-    shown_eur = primary["eur"].eur
 
     # Four columns, not six: at six the values truncate to "321.4 M..." on a laptop.
     c = st.columns(4)

@@ -51,7 +51,7 @@ __all__ = [
     "DPM", "MODELS", "Model", "FitResult", "EurResult", "Series",
     "UnitSystem", "UNITS", "FIELD", "METRIC", "units",
     "M3_TO_BBL", "E3M3_TO_MCF", "KPA_TO_PSI", "M_TO_FT", "HA_TO_ACRE",
-    "nom_from_eff", "eff_from_nom",
+    "nom_from_eff", "eff_from_nom", "effective_decline",
     "fit", "fit_from", "eur", "cumulative", "aicc",
     "bootstrap_eur", "percentile",
     "loss_ratio_b", "loglog_slope", "find_plateau", "extrapolation_multiple",
@@ -667,6 +667,40 @@ def pxx(sorted_values) -> Dict[str, float]:
 # ----------------------------------------------------------------------------
 # diagnostics -- run these BEFORE believing any fit
 # ----------------------------------------------------------------------------
+
+def effective_decline(key: str, p: dict, t_months: float = 0.0,
+                      over_months: float = 12.0) -> float:
+    """Effective decline of a fitted model over the year AHEAD, as a fraction.
+
+        D_eff = 1 - q(t + 12) / q(t)
+
+    The fraction of rate actually lost across a year -- the reserves-report
+    definition -- not the instantaneous -d(ln q)/dt annualised. For exponential
+    the two agree exactly; for everything else they do not, and the secant is
+    the one that means something.
+
+    It is also the only version that survives contact with the whole model set.
+    Duong has a t^(-m) singularity at the origin, so an instantaneous
+    derivative there returns numbers like -1.5e187 -- an annualised rate of
+    change taken across a window in which the rate moves by orders of
+    magnitude is arithmetic, not a decline. The secant is bounded by
+    construction: it cannot exceed 1, and it goes NEGATIVE for a model whose
+    rate rises over the year, which is a reading worth having rather than an
+    overflow.
+
+    Evaluate at the start of the FIT WINDOW, not at t = 0: for several models
+    t = 0 is outside the fitted domain, and for Duong it is a pole.
+    """
+    if key not in MODELS:
+        raise ValueError(f"unknown model {key!r}")
+    if not over_months > 0:
+        raise ValueError(f"the interval must be positive, got {over_months}")
+    q0 = float(np.asarray(rate(key, p, float(t_months))).reshape(-1)[0])
+    q1 = float(np.asarray(rate(key, p, float(t_months) + over_months)).reshape(-1)[0])
+    if not (q0 > 0) or not math.isfinite(q0) or not math.isfinite(q1):
+        return float("nan")
+    return 1.0 - q1 / q0
+
 
 def nominal_decline(t, q, window: int = 7) -> np.ndarray:
     """Local nominal decline D(t) = -dln(q)/dt, by centred moving regression.
