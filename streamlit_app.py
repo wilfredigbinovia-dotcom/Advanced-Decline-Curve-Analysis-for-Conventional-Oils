@@ -152,6 +152,47 @@ _SCALE = {
 }
 
 
+def num(x, sig: int = 4) -> str:
+    """A number for a human: separators, no exponent, ever.
+
+    Python's %g flips to scientific notation once the exponent reaches the
+    precision -- so "%.4g" turns 10,305 into "1.031e+04". On a rate, a volume
+    or a depth that is unreadable, and it had reached the screen in fifteen
+    places. Significant figures are kept below 1,000 and dropped above it,
+    because nobody wants "10,305.47 Mcf/d" either.
+    """
+    if x is None:
+        return "—"
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    if not math.isfinite(v):
+        return "—"
+    a = abs(v)
+    if a >= 1000 or a == 0:
+        return f"{v:,.0f}"
+    decimals = max(0, sig - 1 - int(math.floor(math.log10(a))))
+    return f"{v:,.{min(decimals, 10)}f}".rstrip("0").rstrip(".")
+
+
+def csvnum(x, dp: int = 6) -> str:
+    """Plain decimal for a file: no separators to break a parser, no exponent."""
+    if x is None:
+        return ""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return str(x)
+    if not math.isfinite(v):
+        return ""
+    # A fixed 6 decimals rounds 1e-9 to "0" and loses the row. Below 1, widen
+    # to keep significant figures rather than decimal places.
+    if v != 0 and abs(v) < 1:
+        dp = min(12, max(dp, 7 - int(math.floor(math.log10(abs(v))))))
+    return f"{v:.{dp}f}".rstrip("0").rstrip(".") or "0"
+
+
 def fmt(v, unit="", dp=0):
     """Scale a number into a readable oilfield prefix and label it."""
     if v is None or not math.isfinite(v):
@@ -537,7 +578,10 @@ st.sidebar.subheader("Forecast")
 
 qab_disp = unum(
     st.sidebar, f"Abandonment rate ({unit}/d)", "qab",
-    (50.0 if IS_GAS else 10.0) / VFACTOR, min_value=1e-6, step=1.0, format="%.4g",
+    # 4 decimals, not 2: the floor here is 1e-6 and a metric oil well can sit at
+    # a fraction of a m3/d, which "%.2f" would round to 0.00 in the box while the
+    # forecast used the real value.
+    (50.0 if IS_GAS else 10.0) / VFACTOR, min_value=1e-6, step=1.0, format="%.4f",
     help="For b ≥ 1 the hyperbolic integral does not converge, so this is what makes "
          "the EUR finite. It is doing real work — state it when you report.")
 qab = qab_disp * VFACTOR          # the fit and EUR work in field units
@@ -598,15 +642,15 @@ if ip_route == "Enter it":
           ("10⁹m³" if IS_GAS else "10⁶m³")
     scale_disp = 1e6                       # both Bcf/Mcf and 10⁹m³/10³m³ are x1e6
     val = unum(st.sidebar, f"{'GIIP' if IS_GAS else 'STOIIP'} ({big})", "ip_direct", 10.0,
-               min_value=0.0, step=1.0, format="%.6g",
+               min_value=0.0, step=1.0, format="%.2f",
                help="For THIS well's drainage volume, not the reservoir.")
     in_place = val * scale_disp * VFACTOR if val > 0 else None
-    ip_source = f"entered directly: {val:g} {big}"
+    ip_source = f"entered directly: {num(val)} {big}"
 
 elif ip_route == "Volumetric":
     st.sidebar.caption("Drainage area for **this well**, not the field.")
     area_d = unum(st.sidebar, f"Drainage area ({U.area})", "v_area", 160.0 / U.area_to_acre,
-                  min_value=0.01, max_value=1e6, step=10.0, format="%.4g")
+                  min_value=0.01, max_value=1e6, step=10.0, format="%.2f")
     area = area_d * U.area_to_acre
 
     # Net pay two ways, and only one of them live at a time. Streamlit reruns the
@@ -625,7 +669,7 @@ elif ip_route == "Volumetric":
     # box the user can edit to escape. Net pay wins and stays editable, so
     # clearing it always re-opens the interval.
     pay_d = unum(c2a, f"Net pay ({U.length})", "v_pay", 0.0,
-                 min_value=0.0, max_value=2e4, step=5.0, format="%.4g",
+                 min_value=0.0, max_value=2e4, step=5.0, format="%.2f",
                  disabled=_interval_set and not _pay_set,
                  help="Leave at 0 to build it from the interval instead.")
     c2b.markdown("<div style='padding-top:1.9rem;color:#7e8286;font-size:.8rem'>"
@@ -633,10 +677,10 @@ elif ip_route == "Volumetric":
 
     c7, c8, c9 = st.sidebar.columns(3)
     top_d = unum(c7, f"Top ({U.length})", "v_top", 0.0, min_value=0.0, max_value=6e4,
-                 step=10.0, format="%.6g", disabled=_pay_set,
+                 step=10.0, format="%.2f", disabled=_pay_set,
                  help="True vertical depth to the top of the reservoir.")
     base_d = unum(c8, f"Base ({U.length})", "v_base", 0.0, min_value=0.0, max_value=6e4,
-                  step=10.0, format="%.6g", disabled=_pay_set,
+                  step=10.0, format="%.2f", disabled=_pay_set,
                   help="Same reference as the top — both subsea, or both along hole.")
     ntg = c9.number_input("NTG", 0.01, 1.0, 1.0, step=0.05, key="v_ntg",
                           disabled=_pay_set,
@@ -645,15 +689,15 @@ elif ip_route == "Volumetric":
     pay_err = None
     if _pay_set:
         pay = pay_d * U.length_to_ft
-        st.sidebar.caption(f"Net pay **{pay_d:,.4g} {U.length}**, entered directly. "
+        st.sidebar.caption(f"Net pay **{num(pay_d)} {U.length}**, entered directly. "
                            "Clear it to build net pay from the interval instead.")
     elif base_d > 0 or top_d > 0:
         try:
             pay = dca.net_pay_from_interval(top_d * U.length_to_ft,
                                             base_d * U.length_to_ft, ntg)
             st.sidebar.caption(
-                f"Gross **{base_d - top_d:,.6g} {U.length}** × NTG {ntg:.0%} = net pay "
-                f"**{pay / U.length_to_ft:,.4g} {U.length}**. Enter a net pay above to "
+                f"Gross **{num(base_d - top_d)} {U.length}** × NTG {ntg:.0%} = net pay "
+                f"**{num(pay / U.length_to_ft)} {U.length}**. Enter a net pay above to "
                 "override this.")
         except ValueError as e:
             pay, pay_err = 0.0, str(e)
@@ -672,18 +716,18 @@ elif ip_route == "Volumetric":
             c5, c6 = st.sidebar.columns(2)
             pi_d = unum(c5, f"Initial pressure ({U.pressure})", "v_pi",
                         U.pressure_from_psia(4000.0), min_value=1.0, max_value=2e5,
-                        step=100.0, format="%.6g")
+                        step=100.0, format="%.2f")
             t_d = unum(c6, f"Temperature ({U.temperature})", "v_t",
                        U.temperature_from_degf(200.0), min_value=-50.0, max_value=500.0,
-                       step=5.0, format="%.4g")
+                       step=5.0, format="%.2f")
             sg_v = st.sidebar.number_input("Gas gravity", 0.55, 1.2, 0.65, step=0.01,
                                            key="v_sg")
             pi_v, t_v = U.pressure_to_psia(pi_d), U.temperature_to_degf(t_d)
             # scf -> Mcf, which is the field unit the rest of the app works in
             in_place = dca.volumetric_gas_in_place(area, pay, poro, swi, pi_v, t_v,
                                                    sg_v) / 1000.0
-            ip_source = (f"volumetric · {area_d:,.4g} {U.area} × {pay_d:,.4g} {U.length} × "
-                         f"{poro:.0%} φ × {1-swi:.0%} Sg at {pi_d:,.6g} {U.pressure}")
+            ip_source = (f"volumetric · {num(area_d)} {U.area} × {num(pay_d)} {U.length} × "
+                         f"{poro:.0%} φ × {1-swi:.0%} Sg at {num(pi_d)} {U.pressure}")
         else:
             boi = st.sidebar.number_input("Bo initial (rb/STB)", 1.0, 3.0, 1.25, step=0.05,
                                           key="v_boi",
@@ -691,7 +735,7 @@ elif ip_route == "Volumetric":
                                                "dimensionless in effect, so the same number "
                                                "in either unit system.")
             in_place = dca.volumetric_oil_in_place(area, pay, poro, swi, boi)
-            ip_source = (f"volumetric · {area_d:,.4g} {U.area} × {pay_d:,.4g} {U.length} × "
+            ip_source = (f"volumetric · {num(area_d)} {U.area} × {num(pay_d)} {U.length} × "
                          f"{poro:.0%} φ × {1-swi:.0%} So ÷ Boi {boi:.2f}")
     except ValueError as e:
         if str(e) != "no net pay yet":
@@ -710,7 +754,7 @@ elif ip_route == "From the decline":
                  "Divide by a recovery factor to get in place.")
         in_place = mv_side.movable / (rf_mov / 100.0)
         ip_source = (f"decline · movable {vol(mv_side.movable)} at q→0 "
-                     f"(R² {mv_side.r2:.3f}) ÷ {rf_mov:g}% RF")
+                     f"(R² {mv_side.r2:.3f}) ÷ {num(rf_mov)}% RF")
         if mv_side.r2 < 0.7:
             st.sidebar.warning(f"R² {mv_side.r2:.2f} — the q-vs-cumulative points do not "
                                "form a line, so this intercept is not meaningful.")
@@ -849,7 +893,7 @@ with tab_s:
         f"model **{MODELS[primary_key].name}**, R² {primary['fit'].r2:.4f}")
 
     k = st.columns(4)
-    k[0].metric("Initial forecast rate", f"{dsp(q_initial):,.4g} {unit}/d",
+    k[0].metric("Initial forecast rate", f"{num(dsp(q_initial))} {unit}/d",
                 help="The fitted curve at the start of the fit window, not the first "
                      "row in the file and not extrapolated back to first production.")
     if b_val is not None:
@@ -916,31 +960,42 @@ with tab_s:
                "at that level an independent volume is worth having."))
 
     rows = [
-        ("Well", " · ".join(label_bits) if label_bits else ""),
-        ("Fluid", fluid),
-        ("Model", MODELS[primary_key].name),
-        ("Fit R2 (log q)", f"{primary['fit'].r2:.4f}"),
-        (f"Initial forecast rate ({unit}/d)", f"{dsp(q_initial):.6g}"),
-        ("b (fitted)", f"{b_val:.4f}" if b_val is not None else ""),
-        ("b (loss ratio)", f"{b_data:.4f}" if b_data is not None else ""),
+        # (label, on screen, in the file). The screen gets separators; the file
+        # gets none, because a comma inside an unquoted CSV field is a column
+        # break and "16,457,887" lands in a spreadsheet as text either way.
+        ("Well", " · ".join(label_bits) if label_bits else "", None),
+        ("Fluid", fluid, None),
+        ("Model", MODELS[primary_key].name, None),
+        ("Fit R2 (log q)", f"{primary['fit'].r2:.4f}", primary["fit"].r2),
+        (f"Initial forecast rate ({unit}/d)", num(dsp(q_initial)), dsp(q_initial)),
+        ("b (fitted)", f"{b_val:.4f}" if b_val is not None else "", b_val),
+        ("b (loss ratio)", f"{b_data:.4f}" if b_data is not None else "", b_data),
         ("Initial effective decline (%/yr)",
-         f"{100 * d_initial:.3f}" if math.isfinite(d_initial) else ""),
+         f"{100 * d_initial:.3f}" if math.isfinite(d_initial) else "",
+         100 * d_initial if math.isfinite(d_initial) else None),
         ("Current effective decline (%/yr)",
-         f"{100 * d_now:.3f}" if math.isfinite(d_now) else ""),
-        (f"Cumulative production ({unit})", f"{dsp(cum_to_date):.6g}"),
-        (f"Reserves, remaining ({unit})", f"{dsp(primary['remaining']):.6g}"),
-        (f"EUR ({unit})", f"{dsp(eur_val):.6g}"),
-        (f"EUR P90 ({unit})", f"{dsp(band['P90']):.6g}" if band else ""),
-        (f"EUR P10 ({unit})", f"{dsp(band['P10']):.6g}" if band else ""),
-        (f"{ip_label} ({unit})", f"{dsp(in_place):.6g}" if in_place else ""),
-        (f"{ip_label} basis", ip_source if in_place else ""),
-        ("Well life (yr)", f"{primary['eur'].years:.2f}"),
-        (f"Abandonment rate ({unit}/d)", f"{qab_disp:.6g}"),
+         f"{100 * d_now:.3f}" if math.isfinite(d_now) else "",
+         100 * d_now if math.isfinite(d_now) else None),
+        (f"Cumulative production ({unit})", num(dsp(cum_to_date)), dsp(cum_to_date)),
+        (f"Reserves, remaining ({unit})", num(dsp(primary["remaining"])),
+         dsp(primary["remaining"])),
+        (f"EUR ({unit})", num(dsp(eur_val)), dsp(eur_val)),
+        (f"EUR P90 ({unit})", num(dsp(band["P90"])) if band else "",
+         dsp(band["P90"]) if band else None),
+        (f"EUR P10 ({unit})", num(dsp(band["P10"])) if band else "",
+         dsp(band["P10"]) if band else None),
+        (f"{ip_label} ({unit})", num(dsp(in_place)) if in_place else "",
+         dsp(in_place) if in_place else None),
+        (f"{ip_label} basis", ip_source if in_place else "", None),
+        ("Well life (yr)", f"{primary['eur'].years:.2f}", primary["eur"].years),
+        (f"Abandonment rate ({unit}/d)", num(qab_disp), qab_disp),
     ]
-    summary = pd.DataFrame(rows, columns=["Quantity", "Value"])
+    summary = pd.DataFrame([(a, b) for a, b, _ in rows], columns=["Quantity", "Value"])
+    export = pd.DataFrame([(a, csvnum(c) if c is not None else b) for a, b, c in rows],
+                          columns=["Quantity", "Value"])
     st.dataframe(summary, width="stretch", hide_index=True, height=420)
     st.download_button(
-        "Download the summary as CSV", summary.to_csv(index=False).encode(),
+        "Download the summary as CSV", export.to_csv(index=False).encode(),
         file_name=(("_".join(b.replace(" ", "-") for b in label_bits) or "well")
                    + "_summary.csv"),
         mime="text/csv")
@@ -981,8 +1036,8 @@ with tab_f:
                "Lower the abandonment rate if this well is still economic."))
     elif float(s.q[-1]) <= qab:
         st.warning(
-            f"The last fitted rate is {dsp(s.q[-1]):,.4g} {unit}/d, at or below the "
-            f"abandonment rate of {qab_disp:g} {unit}/d — so remaining reads zero and the "
+            f"The last fitted rate is {num(dsp(s.q[-1]))} {unit}/d, at or below the "
+            f"abandonment rate of {num(qab_disp)} {unit}/d — so remaining reads zero and the "
             f"EUR is just what "
             "has already been produced. Lower the abandonment rate in the sidebar if this "
             "well is still economic.")
@@ -996,8 +1051,8 @@ with tab_f:
         horizon_vol = float(s.q[-1]) * 365.25 * horizon
         st.error(
             f"**This well is not declining, so there is no decline to extrapolate.** "
-            f"The rate is {dsp(s.q[0]):,.4g} {unit}/d at the start of the fit window and "
-            f"{dsp(s.q[-1]):,.4g} {unit}/d at the end, {s.t[-1] / 12:.1f} years later — a "
+            f"The rate is {num(dsp(s.q[0]))} {unit}/d at the start of the fit window and "
+            f"{num(dsp(s.q[-1]))} {unit}/d at the end, {s.t[-1] / 12:.1f} years later — a "
             f"ratio of {flat_rate:.2f}. The best fit scores R² {primary['fit'].r2:.3f} in "
             "log space, i.e. no better than a horizontal line.\n\n"
             f"The EUR below is therefore **not a forecast**: it is the last rate held flat "
@@ -1079,7 +1134,7 @@ with tab_f:
                 line=dict(color=SERIES_COLOURS[i % len(SERIES_COLOURS)],
                           width=3 if k == primary_key else 1.4)))
         fig.add_hline(y=dsp(qab), line_dash="dash", line_color="#7e8286",
-                      annotation_text=f"economic limit {qab_disp:.4g} {unit}/d")
+                      annotation_text=f"economic limit {num(qab_disp)} {unit}/d")
         if not vs_cum:
             fig.add_vline(x=float(s.t[-1]), line_dash="dot", line_color="#7e8286",
                           annotation_text="fit end")
@@ -1117,7 +1172,7 @@ with tab_f:
         f = r["fit"]
         rows.append({
             "Model": MODELS[f.key].name,
-            "Parameters": " · ".join(f"{k} {v:.4g}" for k, v in f.p.items()),
+            "Parameters": " · ".join(f"{k} {num(v)}" for k, v in f.p.items()),
             "R² (log q)": round(f.r2, 4),
             "RMSE log": round(f.rmse_log, 4),
             "ΔAICc": round(f.aicc - best_aicc, 1),
@@ -1639,13 +1694,13 @@ with tab_m:
             oc = st.columns(4)
             o_t_d = unum(oc[0], f"Temperature ({U.temperature})", "omb_t",
                          U.temperature_from_degf(200.0), min_value=-50.0, max_value=500.0,
-                         step=5.0, format="%.4g")
+                         step=5.0, format="%.2f")
             o_t = U.temperature_to_degf(o_t_d)
             o_api = oc[1].number_input("Oil API", 5.0, 60.0, 35.0, step=1.0, key="omb_api")
             o_sg = oc[2].number_input("Gas gravity", 0.55, 1.2, 0.75, step=0.01, key="omb_sg")
             o_pb_d = unum(oc[3], f"Bubble point ({U.pressure})", "omb_pb",
                           U.pressure_from_psia(2500.0), min_value=1.0, max_value=1e5,
-                          step=100.0, format="%.6g",
+                          step=100.0, format="%.2f",
                                       help="Above it the oil is undersaturated and produces "
                                            "by rock and fluid expansion alone.")
             o_pb = U.pressure_to_psia(o_pb_d)
@@ -1695,14 +1750,14 @@ with tab_m:
             elif not omb.saturated:
                 st.info(
                     f"**Undersaturated depletion** — every survey is above the "
-                    f"{o_pb_d:,.6g} {U.pressure} bubble point, so the drive is rock and fluid "
+                    f"{num(o_pb_d)} {U.pressure} bubble point, so the drive is rock and fluid "
                     "expansion alone. Two consequences worth stating in any report: recovery "
                     "factors here are small (5–10% is normal), and the STOIIP is very "
                     "sensitive to rock compressibility, because it is the denominator. Move "
                     "cf from 4 to 6e-6 and watch the answer move with it.")
             else:
                 st.success(
-                    f"**Solution-gas drive** — pressure has fallen below the {o_pb_d:,.6g} {U.pressure} "
+                    f"**Solution-gas drive** — pressure has fallen below the {num(o_pb_d)} {U.pressure} "
                     f"bubble point, so gas is coming out of solution and doing the work. "
                     f"{omb.depletion_drive_pct:.0f}% of the withdrawal is accounted for by "
                     "oil, dissolved gas and rock expansion.")
@@ -1739,7 +1794,7 @@ with tab_m:
                                  "Bo": "Bo (rb/STB)", "Rs": "Rs (scf/STB)",
                                  "Et": "Et (rb/STB)", "F": "F (rb)",
                                  "F_over_Et": "F/Et (STB)"})
-                .style.format("{:,.4g}"), width="stretch", hide_index=True)
+                .style.format(num), width="stretch", hide_index=True)
 
             oil_mismatch = IS_GAS
             if oil_mismatch:
@@ -1760,7 +1815,7 @@ with tab_m:
         c = st.columns(6)
         temp_d = unum(c[0], f"Temperature ({U.temperature})", "mb_t",
                       U.temperature_from_degf(230.0), min_value=-50.0, max_value=500.0,
-                      step=1.0, format="%.4g")
+                      step=1.0, format="%.2f")
         temp = U.temperature_to_degf(temp_d)
         sg = c[1].number_input("Gas gravity", 0.55, 1.2, 0.72, step=0.005, format="%.4f", key="mb_sg")
         api = c[2].number_input("Condensate API (0 = none)", 0.0, 90.0, 0.0, step=1.0,
@@ -1769,7 +1824,7 @@ with tab_m:
                                      "Omitting it biases OGIP low and remaining high.")
         pab_d = unum(c[3], f"Abandonment pressure ({U.pressure})", "mb_pab",
                      U.pressure_from_psia(1000.0), min_value=1.0, max_value=1e5,
-                     step=50.0, format="%.6g")
+                     step=50.0, format="%.2f")
         pab = U.pressure_to_psia(pab_d)
         skip = c[4].number_input("Drop earliest surveys", 0, max(len(pdf) - 3, 0), 0,
                                  key="mb_skip",
@@ -1781,7 +1836,7 @@ with tab_m:
         # uses that, which is what makes the answer ORIGINAL gas in place rather
         # than gas in place on the day of the first survey.
         pi_known_d = unum(c[5], f"Initial pressure ({U.pressure})", "mb_pi",
-                          0.0, min_value=0.0, max_value=2e5, step=50.0, format="%.6g",
+                          0.0, min_value=0.0, max_value=2e5, step=50.0, format="%.2f",
                           help="Leave at 0 and it is estimated from the surveys. Set it "
                                "only if a real initial reservoir pressure is known.")
         pi_known = U.pressure_to_psia(pi_known_d) if pi_known_d > 0 else None
@@ -1802,14 +1857,14 @@ with tab_m:
             wc = st.columns(4)
             depth_d = unum(wc[0], f"Datum depth ({U.length})", "mb_depth",
                            10000.0 / U.length_to_ft, min_value=1.0, max_value=1e5,
-                           step=100.0, format="%.6g",
+                           step=100.0, format="%.2f",
                            help="True vertical depth of the datum the balance is "
                                 "referenced to — mid-perforations or the gas–water "
                                 "contact, not measured depth along a deviated hole.")
             depth_ft = depth_d * U.length_to_ft
             twh_d = unum(wc[1], f"Wellhead temperature ({U.temperature})", "mb_twh",
                          U.temperature_from_degf(90.0), min_value=-50.0, max_value=400.0,
-                         step=5.0, format="%.4g")
+                         step=5.0, format="%.2f")
             t_wh = U.temperature_to_degf(twh_d)
             kind = wc[2].radio("Readings are", ["Shut-in", "Flowing"], key="mb_pkind",
                                help="Shut-in readings become datum pressures the balance "
@@ -1837,7 +1892,7 @@ with tab_m:
                         qs[i] = float(s.q[int(np.argmin(np.abs(sd - d)))])
                 except (KeyError, ValueError, TypeError):
                     st.caption("Survey dates could not be matched to the production "
-                               f"history, so the median rate ({dsp(qs[0]):,.4g} "
+                               f"history, so the median rate ({num(dsp(qs[0]))} "
                                f"{unit}/d) was used for every point.")
                 pdf = pdf.copy()
                 pdf["P"] = [dca.flowing_bhp(p, q, depth_ft, tub, t_wh, temp, sg)
@@ -1856,10 +1911,10 @@ with tab_m:
             lift = float(np.mean(pdf["P"].to_numpy(dtype=float) - raw))
             st.caption(
                 f"Corrected from wellhead to datum through a {sg:.3f}-gravity gas column "
-                f"over {depth_d:,.6g} {U.length}: **+{U.pressure_from_psia(lift):,.4g} "
+                f"over {num(depth_d)} {U.length}: **+{num(U.pressure_from_psia(lift))} "
                 f"{U.pressure} on average** ({lift / depth_ft:.4f} psi/ft), "
-                f"{U.pressure_from_psia(float(raw[0])):,.6g} → "
-                f"{U.pressure_from_psia(float(pdf['P'].iloc[0])):,.6g} {U.pressure} at the "
+                f"{num(U.pressure_from_psia(float(raw[0])))} → "
+                f"{num(U.pressure_from_psia(float(pdf['P'].iloc[0])))} {U.pressure} at the "
                 f"first survey. Average temperature and z, iterated — within about 0.5% of "
                 "a stepwise integration.")
 
@@ -1873,10 +1928,10 @@ with tab_m:
         if math.isfinite(r.p_initial):
             gap = float(pdf["Gp"].min())
             st.caption(
-                (f"Initial pressure **{U.pressure_from_psia(r.p_initial):,.6g} "
+                (f"Initial pressure **{num(U.pressure_from_psia(r.p_initial))} "
                  f"{U.pressure}**, as entered."
                  if r.p_initial_known else
-                 f"Initial pressure taken as **{U.pressure_from_psia(r.p_initial):,.6g} "
+                 f"Initial pressure taken as **{num(U.pressure_from_psia(r.p_initial))} "
                  f"{U.pressure}** at zero cumulative"
                  + (f", estimated because the earliest survey is already "
                     f"{gap / 1000:,.2f} Bcf into the history."
@@ -1964,7 +2019,7 @@ with tab_m:
                                          name="volumetric line",
                                          line=dict(color="#eb6834", dash="dash")))
                 fig.add_hline(y=pab / dca.z_factor(pab, temp, sg), line_dash="dot",
-                              annotation_text=f"abandonment {pab:g} psi")
+                              annotation_text=f"abandonment {num(pab)} psi")
             st.plotly_chart(theme_axes(fig, "cumulative gas (MMscf)", "p/z (psia)",
                                        height=360), width="stretch")
             st.caption("**p/z vs Gp.** Straight for a volumetric tank; the Gp-axis intercept "
@@ -2005,7 +2060,7 @@ with tab_m:
             show["Depleted"] = (100 * show["Depleted"]).map("{:.1f}%".format)
             st.markdown("**Apparent G, survey by survey** — "
                         "`G = Gp / (1 − (p/z)/(pi/zi))`")
-            st.dataframe(show.style.format({f"SBHP ({U.pressure})": "{:,.6g}",
+            st.dataframe(show.style.format({f"SBHP ({U.pressure})": num,
                                             "Cum (MMscf)": "{:,.1f}",
                                             "Apparent G (Bcf)": "{:,.1f}"}),
                          hide_index=True, width="stretch")
@@ -2037,7 +2092,7 @@ with tab_m:
             fc = st.columns(5)
             fc[0].metric("G", f"{f['G_Bcf']:,.0f} Bcf")
             fc[1].metric("Wei", f"{f['Wei_MMbbl']:,.0f} MMbbl")
-            fc[2].metric("J", f"{f['J_bbl_d_psi']:g} bbl/d/psi")
+            fc[2].metric("J", f"{num(f['J_bbl_d_psi'])} bbl/d/psi")
             fc[3].metric("We", f"{f['We_MMbbl']:,.0f} MMbbl")
             fc[4].metric("rms", f"{f['rms_pct']:.1f}%")
             if r.volumetric:
@@ -2065,7 +2120,7 @@ with tab_m:
                         "a finite record; only late depletion of the aquifer separates them. "
                         "This locus, not a single triplet, is the honest output:")
             st.dataframe(f["locus"].style.format({"G_Bcf": "{:,.0f}", "Wei_MMbbl": "{:,.0f}",
-                                                  "J_bbl_d_psi": "{:g}", "rms_pct": "{:.1f}"}),
+                                                  "J_bbl_d_psi": num, "rms_pct": "{:.1f}"}),
                          width="stretch", hide_index=True)
 
             # The hand-off must not cross fluids: a gas volume dropped into an oil
