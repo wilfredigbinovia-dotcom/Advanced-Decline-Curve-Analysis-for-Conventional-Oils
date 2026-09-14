@@ -267,11 +267,18 @@ st.sidebar.title("Decline Curve Workbench")
 
 # --- what this is, before anything about how to read it --------------------
 st.sidebar.subheader("Well")
-wc1, wc2 = st.sidebar.columns(2)
-well_name = wc1.text_input("Well", value="", placeholder="e.g. A-26 LS",
-                           key="well_name")
-reservoir_name = wc2.text_input("Reservoir", value="", placeholder="e.g. D2300X",
-                                key="reservoir_name")
+# Three boxes across a 390px sidebar leaves ~120px each, so the placeholders
+# are short enough to read at that width rather than being clipped mid-word.
+wc1, wc2, wc3 = st.sidebar.columns(3)
+NAME_HELP = ("Field, reservoir and well — broadest first, which is the order they "
+             "appear in the title and in the exported file name. All three are "
+             "optional; whatever is filled in is what gets labelled.")
+field_name = wc1.text_input("Field", value="", placeholder="Uzere W",
+                            key="field_name", help=NAME_HELP)
+reservoir_name = wc2.text_input("Reservoir", value="", placeholder="D2300X",
+                                key="reservoir_name", help=NAME_HELP)
+well_name = wc3.text_input("Well", value="", placeholder="A-26 LS",
+                           key="well_name", help=NAME_HELP)
 
 fc1, fc2 = st.sidebar.columns(2)
 fluid = fc1.radio("Fluid", ["Oil", "Gas"], key="fluid", horizontal=True,
@@ -307,7 +314,10 @@ VUNIT = U.volume_label(IS_GAS)                    # display label
 VIN = UIN.gas_to_mcf if IS_GAS else UIN.oil_to_bbl     # data -> field, on the way in
 VFACTOR = U.gas_to_mcf if IS_GAS else U.oil_to_bbl     # field -> display, on the way out
 
-label_bits = [b for b in (well_name.strip(), reservoir_name.strip()) if b]
+# Field, then reservoir, then well: broadest first, the way an asset is written
+# down and the way a folder of exported summaries sorts into something useful.
+label_bits = [b for b in (field_name.strip(), reservoir_name.strip(),
+                          well_name.strip()) if b]
 WELL_LABEL = " · ".join(label_bits) if label_bits else ""
 
 # --- keep entered values meaning what they meant when they were typed -------
@@ -963,7 +973,9 @@ with tab_s:
         # (label, on screen, in the file). The screen gets separators; the file
         # gets none, because a comma inside an unquoted CSV field is a column
         # break and "16,457,887" lands in a spreadsheet as text either way.
-        ("Well", " · ".join(label_bits) if label_bits else "", None),
+        ("Field", field_name.strip(), None),
+        ("Reservoir", reservoir_name.strip(), None),
+        ("Well", well_name.strip(), None),
         ("Fluid", fluid, None),
         ("Model", MODELS[primary_key].name, None),
         ("Fit R2 (log q)", f"{primary['fit'].r2:.4f}", primary["fit"].r2),
