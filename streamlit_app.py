@@ -1384,14 +1384,82 @@ with tab_m:
 
     mb_path = None
     if mb_src == "Paste":
-        mtxt = st.text_area(
-            "Paste pressure surveys", height=170, key="mb_paste",
-            placeholder="Date\tP (psia)\tCum gas (MMscf)\tCum cond (Mbbl)\tCum water (Mbbl)\n"
-                        "2015-09-01\t5496.2\t253.6\t19.6\t0\n"
-                        "2016-11-01\t5477.0\t1030.8\t64.9\t0.006\n"
-                        "2019-11-01\t5141.4\t14949.5\t1305.7\t17.034",
-            help="Tab, comma or semicolon separated. Header row optional.")
-        mb_path = mtxt if (mtxt or "").strip() else None
+        # Same grid treatment as the production history: a survey table is a
+        # table, and a text box makes the reader guess whether their clipboard
+        # arrived intact. It matters more here than there, because the loader
+        # takes these columns BY POSITION -- headers on the grid show the order
+        # the tool expects instead of leaving it to be read in the help text.
+        MB_BLANK_ROWS = 10
+        GAS_U = "MMscf" if U.name == "field" else "10⁶m³"
+        LIQ_U = "Mbbl" if U.name == "field" else "10³m³"
+        mb_cols = ("Date", f"Pressure ({U.pressure})", f"Cum gas ({GAS_U})",
+                   f"Cum condensate ({LIQ_U})", f"Cum water ({LIQ_U})")
+        mb_template = pd.DataFrame({c: pd.Series([""] * MB_BLANK_ROWS, dtype="string")
+                                    for c in mb_cols})
+
+        st.markdown("#### Paste your pressure surveys")
+        st.caption(
+            "Click the first cell and paste — a whole range at once is fine. Rows are "
+            "added as you need them. Only the first three columns are required; leave "
+            "condensate and water blank if you do not have them.")
+
+        # Nonce in the key, for the same reason as the production grid: deleting a
+        # data_editor's key does not clear it, because the edits live in the
+        # frontend and are replayed onto whatever frame is passed in.
+        mnonce = st.session_state.get("mb_grid_nonce", 0)
+        mb_grid = st.data_editor(
+            mb_template, key=f"mb_paste_grid_{mnonce}", num_rows="dynamic",
+            width="stretch", height=360,
+            column_config={
+                "Date": st.column_config.TextColumn(
+                    "Date", help="Any recognisable format: 2018-06-01, 06/01/2018, "
+                                 "Jun 2018.", width="medium"),
+                mb_cols[1]: st.column_config.TextColumn(
+                    mb_cols[1], help="Static, datum-corrected if you have it. Wellhead "
+                                     "readings are fine — set *Pressures were measured "
+                                     "at* below."),
+                mb_cols[2]: st.column_config.TextColumn(
+                    mb_cols[2], help="Cumulative GAS produced at the survey date, not "
+                                     "the volume that month."),
+                mb_cols[3]: st.column_config.TextColumn(
+                    mb_cols[3], help="Cumulative condensate. Optional, but omitting it "
+                                     "biases OGIP low."),
+                mb_cols[4]: st.column_config.TextColumn(
+                    mb_cols[4], help="Cumulative water. Optional."),
+            })
+
+        def _mb_has(col):
+            return mb_grid[col].astype("string").fillna("").str.strip().ne("")
+
+        mb_filled = mb_grid[_mb_has(mb_cols[0]) & _mb_has(mb_cols[1]) & _mb_has(mb_cols[2])]
+
+        mc1, mc2 = st.columns([3, 1])
+        mc1.caption(f"**{len(mb_filled)}** survey{'' if len(mb_filled) == 1 else 's'} with "
+                    "a date, a pressure and a cumulative. Three is the minimum.")
+        if mc2.button("Clear the table", use_container_width=True, key="mb_clear"):
+            st.session_state["mb_grid_nonce"] = mnonce + 1
+            st.session_state.pop(f"mb_paste_grid_{mnonce}", None)
+            st.rerun()
+
+        with st.expander("Paste as text instead"):
+            st.caption("If the grid will not take your clipboard, paste the raw block "
+                       "here — tab, comma or semicolon separated, header row optional.")
+            mtxt = st.text_area(
+                "Raw paste", height=150, key="mb_paste", label_visibility="collapsed",
+                placeholder="Date\tP (psia)\tCum gas (MMscf)\tCum cond (Mbbl)\tCum water (Mbbl)\n"
+                            "2015-09-01\t5496.2\t253.6\t19.6\t0\n"
+                            "2016-11-01\t5477.0\t1030.8\t64.9\t0.006\n"
+                            "2019-11-01\t5141.4\t14949.5\t1305.7\t17.034")
+
+        # The grid wins when it has data, matching the production side: text left
+        # behind in a collapsed expander must not override what is on screen.
+        if len(mb_filled) >= 3:
+            mb_path = mb_filled.reset_index(drop=True)
+            if (mtxt or "").strip():
+                st.info("Using the table. There is also text in **Paste as text "
+                        "instead** — clear the table if you meant to use that.")
+        else:
+            mb_path = mtxt if (mtxt or "").strip() else None
     elif mb_src == "Upload":
         mup = st.file_uploader(
             "Pressure survey file", type=["csv", "txt", "tsv", "xlsx", "xlsm", "xls"],
