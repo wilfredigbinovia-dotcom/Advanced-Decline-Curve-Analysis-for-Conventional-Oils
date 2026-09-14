@@ -1068,6 +1068,8 @@ class MBResult:
     volumetric: bool
     impossible: bool                    # G <= min(F/Eg) violated
     g_bound: float = float("nan")       # tightest per-survey bound on G, Bcf
+    p_initial: float = float("nan")     # psia at zero cumulative
+    p_initial_known: bool = False       # given by the caller, not extrapolated
     fetkovich: Optional[dict] = None
 
     @property
@@ -1086,7 +1088,8 @@ def material_balance(pressure_psia, gp_mmscf, t_degf: float, sg: float,
                      gas_equivalent_scf_per_bbl: float = 0.0,
                      p_abandon: float = 1000.0,
                      skip_early: int = 0,
-                     fit_aquifer: bool = True) -> MBResult:
+                     fit_aquifer: bool = True,
+                     p_initial: Optional[float] = None) -> MBResult:
     """Gas material balance: p/z, Havlena-Odeh drive diagnosis, Fetkovich aquifer.
 
     p/z vs Gp is straight for a volumetric tank and the Gp-axis intercept is
@@ -1143,27 +1146,49 @@ def material_balance(pressure_psia, gp_mmscf, t_degf: float, sg: float,
     def Bg_cf(p):                        # ft3/scf
         return 0.02827 * z_factor(float(p), t_degf, sg) * TR / float(p)
 
-    i_ref = int(np.argmax(P))
-    p_i = float(P[i_ref])
+    # The reference is INITIAL CONDITIONS -- p at zero cumulative -- not the first
+    # survey. Production almost always starts before anyone runs a build: first gas
+    # in May, first survey in October. Taking that October pressure as "initial"
+    # silently redefines G as the gas in place in October, so everything produced
+    # before it goes missing from the answer, and the earlier the surveys stop the
+    # worse it gets.
+    #
+    # pi comes from the p/z line extrapolated to Gp = 0, unless the caller knows it
+    # and passes it in. That extrapolation assumes the straight line whose validity
+    # is partly what is being tested, which is circular in principle -- but the
+    # alternative is asserting that a mid-life survey is the initial condition,
+    # which is not an assumption, it is an error. Where the gap is short, as it
+    # usually is, the extrapolation is short too.
+    p_from_line = float("nan")
+    if math.isfinite(intercept) and intercept > 0:
+        v = float(intercept)
+        for _ in range(200):
+            vn = float(intercept) * z_factor(max(v, 1.0), t_degf, sg)
+            if abs(vn - v) < 1e-9 * max(vn, 1.0):
+                v = vn
+                break
+            v = vn
+        p_from_line = v
+    p_max = float(np.max(P))
+    if p_initial is not None and p_initial > 0:
+        p_i, p_i_known = float(p_initial), True
+    else:
+        # The line cannot put initial pressure below a pressure that was measured.
+        p_i = max(p_from_line, p_max) if math.isfinite(p_from_line) else p_max
+        p_i_known = False
     Bgi = Bg_cf(p_i)
-    # Everything is measured FROM THE REFERENCE SURVEY. If that survey is not at
-    # zero cumulative -- and it rarely is, since the first build usually happens
-    # after the well has been on a while -- then G below is the gas in place AT
-    # THAT MOMENT, and F has to be the production since then. Counting from zero
-    # inflates F by everything produced before the reference, which is worst at
-    # the earliest points where Eg is smallest, and tilts the whole F/Eg trend.
-    # On the wellstream basis too, matching the p/z line: condensate that came
-    # out of the reservoir as gas has to be in F, or F/Eg understates G.
-    g_ref = float(G[i_ref])
-    w_ref = float(W[i_ref])
+
+    # With the reference at Gp = 0, F is cumulative production from zero -- the
+    # textbook form. On the WELLSTREAM basis, matching the p/z line: condensate
+    # that came out of the reservoir as gas has to be in F, or F/Eg understates G.
     rows = []
     for k in range(len(P)):
         if P[k] >= p_i - 1:
             continue
         bg = Bg_cf(P[k])
         Eg = bg - Bgi
-        Fg = (float(G[k]) - g_ref) * 1e6 * bg
-        Fw = (float(W[k]) - w_ref) * 1e3 * 5.615
+        Fg = float(G[k]) * 1e6 * bg
+        Fw = float(W[k]) * 1e3 * 5.615
         Ftot = Fg + Fw
         if Eg <= 0 or Ftot <= 0:
             continue
@@ -1247,7 +1272,8 @@ def material_balance(pressure_psia, gp_mmscf, t_degf: float, sg: float,
         recovery_factor=100.0 * float(g_ab) / float(ogip) if math.isfinite(ogip) and ogip > 0 else float("nan"),
         ho_rise=ho_rise, min_f_over_eg=min_feg,
         volumetric=volumetric, impossible=impossible,
-        g_bound=g_bound, fetkovich=fetk,
+        g_bound=g_bound, p_initial=float(p_i), p_initial_known=p_i_known,
+        fetkovich=fetk,
     )
 
 

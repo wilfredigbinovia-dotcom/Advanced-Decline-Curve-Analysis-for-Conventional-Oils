@@ -119,12 +119,12 @@ def _loss_ratio(t: tuple, q: tuple):
 
 @st.cache_data(show_spinner=False)
 def _mb(P: tuple, Gp: tuple, cond: tuple, water: tuple, temp: float, sg: float,
-        ge: float, pab: float, skip: int):
+        ge: float, pab: float, skip: int, p_init=None):
     return dca.material_balance(np.array(P), np.array(Gp), temp, sg,
                                 condensate_mbbl=np.array(cond),
                                 water_mbbl=np.array(water),
                                 gas_equivalent_scf_per_bbl=ge,
-                                p_abandon=pab, skip_early=skip)
+                                p_abandon=pab, skip_early=skip, p_initial=p_init)
 
 
 @st.cache_data(show_spinner=False)
@@ -280,7 +280,8 @@ _UNIT_WIDGETS = {
     "qab": "rate", "ip_direct": "volume",
     "v_area": "area", "v_pay": "length", "v_top": "length", "v_base": "length",
     "v_pi": "pressure", "v_t": "temperature",
-    "mb_t": "temperature", "mb_pab": "pressure", "omb_t": "temperature",
+    "mb_t": "temperature", "mb_pab": "pressure", "mb_pi": "pressure",
+    "omb_t": "temperature",
     "omb_pb": "pressure", "mb_depth": "length", "mb_twh": "temperature",
 }
 
@@ -1143,7 +1144,10 @@ with tab_w:
                         delta_color="off")
             m[1].metric("Water produced", liq(wa.cum_water))
             m[2].metric(f"Np at {ec:.0%} — semilog",
-                        "—" if weak_s else fmt(wa.np_semilog),
+                        # vol(), not fmt(): its neighbour is the same quantity by a
+                        # different route, and 14,002,387 beside 14.11 MMbbl reads as
+                        # a disagreement when the two actually agree to 0.8%.
+                        "—" if weak_s else vol(wa.np_semilog),
                         delta=None if not wa.semilog else f"R² {wa.semilog['r2']:.3f}",
                         delta_color="off")
             m[3].metric(f"Np at {ec:.0%} — X-plot",
@@ -1615,7 +1619,7 @@ with tab_m:
                        "this cumulative are **this well's**.")
             st.stop()
 
-        c = st.columns(5)
+        c = st.columns(6)
         temp_d = unum(c[0], f"Temperature ({U.temperature})", "mb_t",
                       U.temperature_from_degf(230.0), min_value=-50.0, max_value=500.0,
                       step=1.0, format="%.4g")
@@ -1633,6 +1637,16 @@ with tab_m:
                                  key="mb_skip",
                                  help="Use this when the consistency guard fires and the "
                                       "first survey predates a reliable reference.")
+        # Usually nobody has this. Production starts in May and the first build is
+        # run in October, so the earliest survey is already down the depletion
+        # line. Left at 0 the balance extrapolates p/z back to zero cumulative and
+        # uses that, which is what makes the answer ORIGINAL gas in place rather
+        # than gas in place on the day of the first survey.
+        pi_known_d = unum(c[5], f"Initial pressure ({U.pressure})", "mb_pi",
+                          0.0, min_value=0.0, max_value=2e5, step=50.0, format="%.6g",
+                          help="Leave at 0 and it is estimated from the surveys. Set it "
+                               "only if a real initial reservoir pressure is known.")
+        pi_known = U.pressure_to_psia(pi_known_d) if pi_known_d > 0 else None
         ge = dca.condensate_gas_equivalent(api) if api > 8.9 else 0.0
 
         # --- wellhead pressures -------------------------------------------
@@ -1713,10 +1727,24 @@ with tab_m:
 
         try:
             r = _mb(tuple(pdf["P"]), tuple(pdf["Gp"]), tuple(pdf["condensate"]),
-                    tuple(pdf["water"]), temp, sg, ge, pab, int(skip))
+                    tuple(pdf["water"]), temp, sg, ge, pab, int(skip), pi_known)
         except ValueError as e:                          # noqa: BLE001
             st.error(str(e))
             st.stop()
+
+        if math.isfinite(r.p_initial):
+            gap = float(pdf["Gp"].min())
+            st.caption(
+                (f"Initial pressure **{U.pressure_from_psia(r.p_initial):,.6g} "
+                 f"{U.pressure}**, as entered."
+                 if r.p_initial_known else
+                 f"Initial pressure taken as **{U.pressure_from_psia(r.p_initial):,.6g} "
+                 f"{U.pressure}** at zero cumulative"
+                 + (f", estimated because the earliest survey is already "
+                    f"{gap / 1000:,.2f} Bcf into the history."
+                    if gap > 0.01 else "."))
+                + " Volumes below are **original** gas in place, not gas in place at the "
+                  "first survey.")
 
         m = st.columns(5)
         m[0].metric("OGIP (p/z)", f"{r.ogip_pz / 1000:,.1f} Bcf", delta=f"R² {r.r2:.4f}",
