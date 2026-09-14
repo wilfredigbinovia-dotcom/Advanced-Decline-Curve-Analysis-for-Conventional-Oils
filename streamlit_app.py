@@ -280,7 +280,7 @@ _UNIT_WIDGETS = {
     "qab": "rate", "ip_direct": "volume",
     "v_area": "area", "v_pay": "length", "v_pi": "pressure", "v_t": "temperature",
     "mb_t": "temperature", "mb_pab": "pressure", "omb_t": "temperature",
-    "omb_pb": "pressure",
+    "omb_pb": "pressure", "mb_depth": "length", "mb_twh": "temperature",
 }
 
 
@@ -793,6 +793,29 @@ with tab_f:
             "has already been produced. Lower the abandonment rate in the sidebar if this "
             "well is still economic.")
 
+    # A fit that explains nothing must not be reported as a forecast. R2 near zero
+    # in log space means the model is no better than a horizontal line -- and for a
+    # flat well that is exactly what it has fitted, so the "EUR" is just the last
+    # rate times the horizon, and moving the horizon moves the answer.
+    flat_rate = float(s.q[-1]) / max(float(s.q[0]), 1e-9)
+    if dca.not_declining(s.t, s.q, primary["fit"].r2):
+        horizon_vol = float(s.q[-1]) * 365.25 * horizon
+        st.error(
+            f"**This well is not declining, so there is no decline to extrapolate.** "
+            f"The rate is {dsp(s.q[0]):,.4g} {unit}/d at the start of the fit window and "
+            f"{dsp(s.q[-1]):,.4g} {unit}/d at the end, {s.t[-1] / 12:.1f} years later — a "
+            f"ratio of {flat_rate:.2f}. The best fit scores R² {primary['fit'].r2:.3f} in "
+            "log space, i.e. no better than a horizontal line.\n\n"
+            f"The EUR below is therefore **not a forecast**: it is the last rate held flat "
+            f"for the {horizon:.0f}-year horizon ({vol(horizon_vol)}), and it moves with "
+            "the horizon rather than with the reservoir. Change the maximum well life and "
+            "watch it change.\n\n"
+            "A flat well is usually offtake-constrained — facility, compressor, contract or "
+            "quota — and its forecast is a facilities question, not a decline one. What it "
+            "needs is pressure data: a flat rate with **falling** pressure is depleting "
+            "behind a constraint, a flat rate with **steady** pressure has support or a "
+            "large connected volume. Neither is knowable from the rate alone.")
+
     mult, verdict = dca.extrapolation_multiple(primary["remaining"], cum_to_date)
     if mult > 1.0:
         st.error(f"**Extrapolation multiple {mult:.2f}×** — {verdict}. "
@@ -1297,8 +1320,11 @@ with tab_m:
         "titled a dozen different ways and the order is the one thing that stays put. "
         "Three surveys is the minimum; the more of the depletion history they span, the "
         "better the drive diagnosis.\n\n"
-        "Pressures should be static, datum-corrected, and from builds long enough to have "
-        "stabilised."
+        "Static, datum-corrected pressures from builds long enough to have stabilised are "
+        "what the balance wants. If all you have is **wellhead** pressure — which is the "
+        "usual case — enter it anyway and set *Pressures were measured at* to Wellhead; "
+        "the gas column is added for you. Flowing readings are accepted too, and the "
+        "answer they give is labelled for what it is: a lower bound."
     )
 
     mb_path = None
@@ -1486,6 +1512,82 @@ with tab_m:
                                       "first survey predates a reliable reference.")
         ge = dca.condensate_gas_equivalent(api) if api > 8.9 else 0.0
 
+        # --- wellhead pressures -------------------------------------------
+        # Most operators have tubing-head pressure and no datum-corrected
+        # survey at all, so refusing anything but a datum pressure means
+        # refusing the data that actually exists. The gas column is cheap to
+        # add and the assumptions are statable, so state them.
+        where = st.radio(
+            "Pressures were measured at", ["Datum (bottomhole)", "Wellhead"],
+            horizontal=True, key="mb_where",
+            help="A wellhead reading is lighter than the datum pressure by the weight "
+                 "of the gas column above it — roughly 0.02–0.13 psi/ft. Uncorrected, "
+                 "it reads as a reservoir that was never as full as it was.")
+        if where == "Wellhead":
+            wc = st.columns(4)
+            depth_d = unum(wc[0], f"Datum depth ({U.length})", "mb_depth",
+                           10000.0 / U.length_to_ft, min_value=1.0, max_value=1e5,
+                           step=100.0, format="%.6g",
+                           help="True vertical depth of the datum the balance is "
+                                "referenced to — mid-perforations or the gas–water "
+                                "contact, not measured depth along a deviated hole.")
+            depth_ft = depth_d * U.length_to_ft
+            twh_d = unum(wc[1], f"Wellhead temperature ({U.temperature})", "mb_twh",
+                         U.temperature_from_degf(90.0), min_value=-50.0, max_value=400.0,
+                         step=5.0, format="%.4g")
+            t_wh = U.temperature_to_degf(twh_d)
+            kind = wc[2].radio("Readings are", ["Shut-in", "Flowing"], key="mb_pkind",
+                               help="Shut-in readings become datum pressures the balance "
+                                    "can use directly. Flowing readings carry drawdown "
+                                    "with them and bias the answer low.")
+            tub = wc[3].number_input("Tubing ID (in)", 0.5, 9.0, 2.441, step=0.005,
+                                     format="%.3f", key="mb_tub",
+                                     disabled=(kind == "Shut-in"),
+                                     help="Only the flowing case needs it — friction "
+                                          "scales as 1/d⁵, so this is not a detail.")
+
+            raw = pdf["P"].to_numpy(dtype=float)
+            if kind == "Shut-in":
+                pdf = pdf.copy()
+                pdf["P"] = [dca.static_gas_column(p, depth_ft, t_wh, temp, sg)
+                            for p in raw]
+            else:
+                # Flowing needs the rate at each survey. Take it from this
+                # well's own history by date rather than asking twice.
+                qs = np.full(len(raw), float(np.median(s.q)))
+                try:
+                    sd = pd.to_datetime(s.dates).to_numpy().astype("datetime64[D]")
+                    pd_ = pd.to_datetime(pdf["date"]).to_numpy().astype("datetime64[D]")
+                    for i, d in enumerate(pd_):
+                        qs[i] = float(s.q[int(np.argmin(np.abs(sd - d)))])
+                except (KeyError, ValueError, TypeError):
+                    st.caption("Survey dates could not be matched to the production "
+                               f"history, so the median rate ({dsp(qs[0]):,.4g} "
+                               f"{unit}/d) was used for every point.")
+                pdf = pdf.copy()
+                pdf["P"] = [dca.flowing_bhp(p, q, depth_ft, tub, t_wh, temp, sg)
+                            for p, q in zip(raw, qs)]
+                st.warning(
+                    "**Flowing pressures bias this answer low.** A flowing bottomhole "
+                    "pressure is the reservoir pressure minus the drawdown, so every "
+                    "point on the p/z plot sits below where the reservoir actually is. "
+                    "If the rate has been steady the offset is roughly steady too, the "
+                    "line stays straight, and it shifts down — which moves the intercept "
+                    "left. **Read the OGIP below as a lower bound**, not an estimate. It "
+                    "also assumes the tubing is carrying gas alone: once a well starts "
+                    "loading up with water, the column is heavier than this model and the "
+                    "computed pressure falls for a reason that is not depletion.")
+
+            lift = float(np.mean(pdf["P"].to_numpy(dtype=float) - raw))
+            st.caption(
+                f"Corrected from wellhead to datum through a {sg:.3f}-gravity gas column "
+                f"over {depth_d:,.6g} {U.length}: **+{U.pressure_from_psia(lift):,.4g} "
+                f"{U.pressure} on average** ({lift / depth_ft:.4f} psi/ft), "
+                f"{U.pressure_from_psia(float(raw[0])):,.6g} → "
+                f"{U.pressure_from_psia(float(pdf['P'].iloc[0])):,.6g} {U.pressure} at the "
+                f"first survey. Average temperature and z, iterated — within about 0.5% of "
+                "a stepwise integration.")
+
         try:
             r = _mb(tuple(pdf["P"]), tuple(pdf["Gp"]), tuple(pdf["condensate"]),
                     tuple(pdf["water"]), temp, sg, ge, pab, int(skip))
@@ -1502,6 +1604,21 @@ with tab_m:
         m[3].metric("Remaining (p/z)", f"{r.remaining / 1000:,.1f} Bcf")
         m[4].metric("F/Eg rise", f"{r.ho_rise:.2f}×" if math.isfinite(r.ho_rise) else "—")
 
+        # Remaining is measured from the LAST SURVEY, because that is the last
+        # point the pressure line actually knows about. If the well has kept
+        # producing since, that volume is already gone and remaining overstates
+        # what is left by exactly the gap.
+        if IS_GAS:
+            since = float(s.cum[-1]) / 1000.0 - r.gp_now        # MMscf
+            if since > 0.01 * max(r.gp_now, 1.0):
+                st.caption(
+                    f"**Remaining is measured from the last survey**, at "
+                    f"{r.gp_now / 1000:,.2f} Bcf. This well has produced "
+                    f"{since / 1000:,.2f} Bcf since then, so counted from today's "
+                    f"{float(s.cum[-1]) / 1e6:,.2f} Bcf the remaining volume is "
+                    f"**{(r.remaining - since) / 1000:,.1f} Bcf**. The pressure line "
+                    "knows nothing past its last point; only the production does.")
+
         if r.impossible:
             st.error(
                 f"**Consistency guard fired.** Material balance requires G ≤ min(F/Eg) = "
@@ -1510,11 +1627,21 @@ with tab_m:
                 "and no aquifer model rescues that. The usual cause is a reference pressure "
                 "taken **after** first production: pi is then too low, every Eg downstream too "
                 "small, and F/Eg too large everywhere. Try dropping the earliest survey above.")
-        elif r.volumetric:
+        elif r.volumetric and r.ho_rise <= 1.10:
             st.success(
                 f"**Volumetric depletion.** F/Eg is flat ({r.ho_rise:.2f}× across the record), "
                 "so the gas is producing by its own expansion and the p/z intercept is a real "
                 "number. Recovery factors of 80–90% are normal here.")
+        elif r.volumetric:
+            # 1.10-1.25 is not flat. Calling it flat because it cleared a
+            # threshold hides the fact that the threshold nearly caught it.
+            st.warning(
+                f"**Borderline — F/Eg climbs {r.ho_rise:.2f}×.** That is under the 1.25× at "
+                "which this tool calls water drive, but it is not flat either, and a rise this "
+                "size is what early or weak pressure support looks like before it becomes "
+                "obvious. Treat the p/z intercept as an upper bound, check whether produced "
+                "water is accelerating, and prefer a recovery factor nearer 70% than 90% until "
+                "another survey settles which way it is going.")
         else:
             st.warning(
                 f"**Water drive or pressure support.** F/Eg climbs {r.ho_rise:.2f}×, so "
@@ -1522,6 +1649,21 @@ with tab_m:
                 "**artefact, not a volume** — a water-driven reservoir holds pressure up, "
                 "which flattens the trend and inflates the intercept. Use the aquifer fit "
                 "below and a recovery factor of 50–70%.")
+
+        # We >= 0 makes min(F/Eg) a ceiling on G, and it binds whether or not
+        # the drive verdict came out volumetric. A p/z intercept above it is the
+        # straight line reading through curvature it should have caught.
+        if (math.isfinite(r.min_f_over_eg) and math.isfinite(r.ogip_pz)
+                and r.ogip_pz / 1000.0 > r.min_f_over_eg * 1.10 and not r.impossible):
+            over = r.ogip_pz / 1000.0 / r.min_f_over_eg
+            st.error(
+                f"**The p/z intercept is above what material balance allows.** Since We ≥ 0, "
+                f"G ≤ min(F/Eg) = **{r.min_f_over_eg:,.1f} Bcf**, but the straight line reads "
+                f"{r.ogip_pz / 1000:,.1f} Bcf — {over:.2f}× the ceiling. Take "
+                f"{r.min_f_over_eg:,.1f} Bcf as the upper bound on this tank and treat the "
+                "intercept as what it is: a line fitted through a trend that is curving. "
+                "Recoverable volumes computed from the intercept are overstated by at least "
+                "the same factor.")
 
         g1, g2 = st.columns(2)
         with g1:
@@ -1541,31 +1683,64 @@ with tab_m:
                        "volumetric reservoir — the panel beside it is.")
         with g2:
             if math.isfinite(r.ho_rise):
-                ho = r.points
+                d = r.points
+                ok = d["F_over_Eg_reliable"]
                 fig = go.Figure()
-                Bgi = None
-                xs, ys = [], []
-                TR = temp + 459.67
-                pi = float(r.points["P"].max())
-                Bgi = 0.02827 * dca.z_factor(pi, temp, sg) * TR / pi
-                for _, row in r.points.iterrows():
-                    if row["P"] >= pi - 1:
-                        continue
-                    bg = 0.02827 * dca.z_factor(row["P"], temp, sg) * TR / row["P"]
-                    Eg = bg - Bgi
-                    F = row["Gp_gas_only"] * 1e6 * bg + row["water_Mbbl"] * 1e3 * 5.615
-                    if Eg > 0 and F > 0:
-                        xs.append(row["Gp"])
-                        ys.append(F / Eg / 1e9)
-                fig.add_trace(go.Scatter(x=xs, y=ys, mode="lines+markers", name="F/Eg",
-                                         line=dict(color="#2a78d6")))
-                if ys:
-                    fig.add_hline(y=ys[0], line_dash="dash", line_color="#7e8286",
-                                  annotation_text=f"first point {ys[0]:,.0f} Bcf")
+                if ok.any():
+                    fig.add_trace(go.Scatter(x=d.loc[ok, "Gp"], y=d.loc[ok, "F_over_Eg_Bcf"],
+                                             mode="lines+markers", name="F/Eg",
+                                             line=dict(color="#2a78d6")))
+                    fig.add_hline(y=float(d.loc[ok, "F_over_Eg_Bcf"].iloc[0]),
+                                  line_dash="dash", line_color="#7e8286",
+                                  annotation_text=f"first reliable "
+                                                  f"{d.loc[ok, 'F_over_Eg_Bcf'].iloc[0]:,.0f} Bcf")
+                weak = d["F_over_Eg_Bcf"].notna() & ~ok
+                if weak.any():
+                    fig.add_trace(go.Scatter(x=d.loc[weak, "Gp"], y=d.loc[weak, "F_over_Eg_Bcf"],
+                                             mode="markers", name="too near the reference",
+                                             marker=dict(color="#c2c7cc", size=9,
+                                                         symbol="circle-open")))
                 st.plotly_chart(theme_axes(fig, "cumulative gas (MMscf)", "F / Eg (Bcf)",
                                            height=360), width="stretch")
                 st.caption("**Havlena–Odeh.** F = G·Eg + We. Flat means We ≈ 0 and the level "
                            "*is* G. Rising means influx. This is the discriminator.")
+
+        # Apparent G, survey by survey. Same physics as the panel above, none of
+        # the PVT algebra: a closed tank returns one number six times.
+        d = r.points
+        ok = d["apparent_G_usable"]
+        if ok.sum() >= 2:
+            show = d.loc[ok, ["P", "Gp", "depleted", "apparent_G_Bcf"]].copy()
+            show.columns = [f"SBHP ({U.pressure})", "Cum (MMscf)", "Depleted", "Apparent G (Bcf)"]
+            show[f"SBHP ({U.pressure})"] = U.pressure_from_psia(show[f"SBHP ({U.pressure})"])
+            show["Depleted"] = (100 * show["Depleted"]).map("{:.1f}%".format)
+            st.markdown("**Apparent G, survey by survey** — "
+                        "`G = Gp / (1 − (p/z)/(pi/zi))`")
+            st.dataframe(show.style.format({f"SBHP ({U.pressure})": "{:,.6g}",
+                                            "Cum (MMscf)": "{:,.1f}",
+                                            "Apparent G (Bcf)": "{:,.1f}"}),
+                         hide_index=True, width="stretch")
+            spread = float(d.loc[ok, "apparent_G_Bcf"].iloc[-1]
+                           / d.loc[ok, "apparent_G_Bcf"].iloc[0])
+            if spread > 1.10:
+                st.warning(
+                    f"**Apparent G climbs {spread:.2f}× across the surveys**, from "
+                    f"{r.g_bound:,.1f} to {d.loc[ok, 'apparent_G_Bcf'].iloc[-1]:,.1f} Bcf. A "
+                    "closed tank returns the same number every time; support holds p/z up, "
+                    "which inflates every estimate and inflates the later ones more. So the "
+                    f"**smallest** value is the tightest bound: **G ≤ {r.g_bound:,.1f} Bcf**, "
+                    "and the straight-line intercept is the least reliable reading of the set "
+                    "because it is dominated by the latest, most inflated points.")
+            elif spread < 0.91:
+                st.warning(
+                    f"**Apparent G falls {spread:.2f}× across the surveys.** Influx only "
+                    "accumulates, so it cannot produce a falling trend. Suspect the reference "
+                    "pressure, the datum correction, or production allocated to this well.")
+            else:
+                st.success(
+                    f"**Apparent G is level ({spread:.2f}× across the surveys)** at about "
+                    f"{d.loc[ok, 'apparent_G_Bcf'].median():,.1f} Bcf. That is what a closed "
+                    "tank looks like, and it is independent confirmation of the p/z intercept.")
 
         if r.fetkovich:
             f = r.fetkovich

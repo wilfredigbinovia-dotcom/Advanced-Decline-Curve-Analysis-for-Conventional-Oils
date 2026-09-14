@@ -853,6 +853,30 @@ def extrapolation_multiple(remaining: float, cum_to_date: float) -> tuple:
     return m, v
 
 
+def not_declining(t, q, r2: float) -> bool:
+    """Is this series flat enough that no decline forecast is defensible?
+
+    Three conditions, all required:
+
+        r2 < 0.25     the fit explains essentially nothing in log space --
+                      the best curve through the data is a horizontal line
+        0.6 < ratio   the last rate is within a factor of ~1.5 of the first,
+             < 1.7    in either direction, so there is nothing to decline
+        n >= 24       two years of record, so a short noisy history is not
+                      condemned on the strength of a handful of months
+
+    When this is true the "EUR" is not a forecast: it is the last rate times
+    the horizon, and it moves with the horizon rather than with the reservoir.
+    A flat well is usually held back by a facility, a compressor or a contract,
+    and what it needs is pressure data, not a better curve fit.
+    """
+    q = np.asarray(q, dtype=float)
+    if q.size < 24 or float(q[0]) <= 0:
+        return False
+    ratio = float(q[-1]) / float(q[0])
+    return bool(r2 < 0.25 and 0.6 < ratio < 1.7)
+
+
 # ----------------------------------------------------------------------------
 # water analysis
 # ----------------------------------------------------------------------------
@@ -1042,6 +1066,7 @@ class MBResult:
     min_f_over_eg: float                # Bcf
     volumetric: bool
     impossible: bool                    # G <= min(F/Eg) violated
+    g_bound: float = float("nan")       # tightest per-survey bound on G, Bcf
     fetkovich: Optional[dict] = None
 
     @property
@@ -1120,14 +1145,24 @@ def material_balance(pressure_psia, gp_mmscf, t_degf: float, sg: float,
     i_ref = int(np.argmax(P))
     p_i = float(P[i_ref])
     Bgi = Bg_cf(p_i)
+    # Everything is measured FROM THE REFERENCE SURVEY. If that survey is not at
+    # zero cumulative -- and it rarely is, since the first build usually happens
+    # after the well has been on a while -- then G below is the gas in place AT
+    # THAT MOMENT, and F has to be the production since then. Counting from zero
+    # inflates F by everything produced before the reference, which is worst at
+    # the earliest points where Eg is smallest, and tilts the whole F/Eg trend.
+    # On the wellstream basis too, matching the p/z line: condensate that came
+    # out of the reservoir as gas has to be in F, or F/Eg understates G.
+    g_ref = float(G[i_ref])
+    w_ref = float(W[i_ref])
     rows = []
     for k in range(len(P)):
         if P[k] >= p_i - 1:
             continue
         bg = Bg_cf(P[k])
         Eg = bg - Bgi
-        Fg = Gs[k] * 1e6 * bg
-        Fw = W[k] * 1e3 * 5.615
+        Fg = (float(G[k]) - g_ref) * 1e6 * bg
+        Fw = (float(W[k]) - w_ref) * 1e3 * 5.615
         Ftot = Fg + Fw
         if Eg <= 0 or Ftot <= 0:
             continue
@@ -1136,11 +1171,21 @@ def material_balance(pressure_psia, gp_mmscf, t_degf: float, sg: float,
                      "F_over_Eg_Bcf": Ftot / Eg / 1e9})
     ho = pd.DataFrame(rows)
 
+    # A survey taken close to the reference has a vanishing Eg, and F/Eg there is
+    # a small number divided by a smaller one -- unbounded leverage on a ratio
+    # that is supposed to describe the whole history. One such point at 6% of the
+    # largest Eg once read 180 Bcf against a true trend of 61 -> 75, which
+    # inverted the rise to 0.36x and had the tool call a supported reservoir
+    # volumetric. Such points stay in the frame, flagged, and out of the verdict.
+    if len(ho):
+        ho["reliable"] = ho["Eg"] >= 0.15 * float(ho["Eg"].max())
+    solid = ho[ho["reliable"]] if len(ho) else ho
+
     ho_rise = float("nan")
     min_feg = float("nan")
-    if len(ho) > 1:
-        ho_rise = float(ho["F_over_Eg_Bcf"].iloc[-1] / ho["F_over_Eg_Bcf"].iloc[0])
-        min_feg = float(ho["F_over_Eg_Bcf"].min())
+    if len(solid) > 1:
+        ho_rise = float(solid["F_over_Eg_Bcf"].iloc[-1] / solid["F_over_Eg_Bcf"].iloc[0])
+        min_feg = float(solid["F_over_Eg_Bcf"].min())
 
     gp_bcf = gp_now / 1000.0
     impossible = math.isfinite(min_feg) and min_feg < gp_bcf
@@ -1150,8 +1195,49 @@ def material_balance(pressure_psia, gp_mmscf, t_degf: float, sg: float,
     if fit_aquifer and not impossible and len(ho) >= 3:
         fetk = fetkovich_fit(P, G, W, t_degf, sg, p_i, gp_bcf, min_feg)
 
+    # --- apparent G, survey by survey -------------------------------------
+    # Rearranging p/z = (pi/zi)(1 - Gp/G) gives G = Gp / (1 - (p/z)/(pi/zi)).
+    # For a closed tank every survey returns the SAME number. Pressure support
+    # holds p/z up, which shrinks the denominator, so each survey OVERSTATES G
+    # -- and overstates it more as the support accumulates. That makes the
+    # sequence a drive diagnostic on its own, in the units of the answer:
+    #
+    #   level        volumetric, and the level is G
+    #   rising       support, and the SMALLEST value is the tightest bound on G
+    #   not monotone something is wrong with a survey; influx never un-happens
+    #
+    # It says the same thing as F/Eg with none of the PVT algebra, which is why
+    # it is worth carrying alongside: two routes, one arithmetic each.
+    with np.errstate(divide="ignore", invalid="ignore"):
+        depleted = 1.0 - pz / intercept if intercept > 0 else np.full_like(pz, np.nan)
+        app_g = np.where(depleted > 1e-9, G / 1000.0 / depleted, np.nan)
+    # A survey barely into depletion divides by almost nothing, so its apparent
+    # G is noise amplified; 3% is where the number starts to mean something.
+    app_ok = depleted >= 0.03
+    g_bound = float(np.nanmin(app_g[app_ok])) if app_ok.any() else float("nan")
+    # No monotonicity test here. Influx only accumulates, so in principle the
+    # sequence should never fall -- but real surveys scatter enough to break that
+    # on data that is behaving: the volumetric sample reservoir wobbles +/-10%
+    # about a level 365 Bcf, and the water-drive one dips 0.76x in the middle of
+    # a 1.59x rise. A flag that fires on both is worse than no flag.
+
     pts = pd.DataFrame({"P": P, "z": z, "pz": pz, "Gp": G, "Gp_gas_only": Gs,
-                        "condensate_Mbbl": C, "water_Mbbl": W})
+                        "condensate_Mbbl": C, "water_Mbbl": W,
+                        "depleted": depleted, "apparent_G_Bcf": app_g,
+                        "apparent_G_usable": app_ok})
+    # Carry F/Eg on the frame so callers plot the number that was computed here
+    # rather than deriving it again. Three of this function's bugs lived in a
+    # second copy of this arithmetic written for a chart.
+    pts["F_over_Eg_Bcf"] = np.nan
+    pts["F_over_Eg_reliable"] = False
+    if len(ho):
+        by_p = {round(float(v), 6): (float(f), bool(rel)) for v, f, rel
+                in zip(ho["P"], ho["F_over_Eg_Bcf"], ho["reliable"])}
+        for i, v in enumerate(P):
+            hit = by_p.get(round(float(v), 6))
+            if hit is not None:
+                pts.iloc[i, pts.columns.get_loc("F_over_Eg_Bcf")] = hit[0]
+                pts.iloc[i, pts.columns.get_loc("F_over_Eg_reliable")] = hit[1]
 
     return MBResult(
         points=pts, ogip_pz=float(ogip), pz_i=float(intercept), r2=r2,
@@ -1159,7 +1245,8 @@ def material_balance(pressure_psia, gp_mmscf, t_degf: float, sg: float,
         remaining=max(float(g_ab) - gp_now, 0.0),
         recovery_factor=100.0 * float(g_ab) / float(ogip) if math.isfinite(ogip) and ogip > 0 else float("nan"),
         ho_rise=ho_rise, min_f_over_eg=min_feg,
-        volumetric=volumetric, impossible=impossible, fetkovich=fetk,
+        volumetric=volumetric, impossible=impossible,
+        g_bound=g_bound, fetkovich=fetk,
     )
 
 
@@ -1303,6 +1390,119 @@ CF_PER_ACRE_FT = 43560.0           # cubic feet in an acre-foot
 def gas_fvf(p_psia: float, t_degf: float, sg: float) -> float:
     """Bg in ft3/scf."""
     return 0.02827 * z_factor(p_psia, t_degf, sg) * (t_degf + 459.67) / p_psia
+
+
+def _friction_factor(tubing_id_in: float) -> float:
+    """Moody friction factor for a gas well, from tubing size alone.
+
+    The Cullender-Smith smooth-pipe approximation. It drops the Reynolds
+    dependence, which is defensible because gas wells run fully turbulent over
+    almost their whole rate range -- f varies by a few percent across two orders
+    of magnitude in rate, and the friction term is a minority of the total
+    pressure drop in any case. Pass an explicit f if the tubing is known rough.
+    """
+    if not tubing_id_in > 0:
+        raise ValueError(f"tubing ID must be positive, got {tubing_id_in}")
+    return (0.01750 / tubing_id_in ** 0.224 if tubing_id_in < 4.277
+            else 0.01603 / tubing_id_in ** 0.164)
+
+
+def static_gas_column(p_wh_psia: float, depth_ft: float, t_wh_degf: float,
+                      t_bh_degf: float, sg: float = 0.65) -> float:
+    """Bottomhole pressure from a SHUT-IN wellhead pressure.
+
+        s = 0.01875 * sg * H / (Tbar * zbar)
+        p_bh = p_wh * exp(s)
+
+    The weight of the gas column, nothing more -- no flow, so no friction. It
+    is the integral of dp/dh = 0.01875*sg*p/(z*T), which is just rho*g/gc with
+    rho from the real gas law, evaluated with an average temperature and z.
+    zbar depends on the answer, so it is iterated to convergence.
+
+    Note the 0.01875. The constant 0.0375 that appears in most textbook
+    write-ups belongs to the SQUARED form used for flowing wells, and is
+    exactly twice this one -- writing it here doubles the exponent and puts a
+    0.168 psi/ft gradient on a gas column that should be near 0.078. Verified
+    against a stepwise integration, not against the formula it came from.
+
+    `t_wh_degf`/`t_bh_degf` bracket the geothermal profile; a linear average is
+    all this method uses. Returns psia -- feed it psia.
+
+    This is the conversion that turns a shut-in wellhead reading into something
+    the material balance can use. A FLOWING wellhead pressure must go through
+    `flowing_bhp` instead, and even then carries drawdown with it.
+    """
+    if not p_wh_psia > 0:
+        raise ValueError(f"wellhead pressure must be positive, got {p_wh_psia}")
+    if depth_ft < 0:
+        raise ValueError(f"depth must not be negative, got {depth_ft}")
+    tbar = (t_wh_degf + t_bh_degf) / 2.0
+    if tbar + 459.67 <= 0:
+        raise ValueError("average temperature is below absolute zero")
+    p = p_wh_psia
+    for _ in range(100):
+        zbar = z_factor((p_wh_psia + p) / 2.0, tbar, sg)
+        s = 0.01875 * sg * depth_ft / ((tbar + 459.67) * zbar)
+        pn = p_wh_psia * math.exp(s)
+        if abs(pn - p) < 1e-9 * max(pn, 1.0):
+            return pn
+        p = pn
+    return p
+
+
+def flowing_bhp(p_tf_psia: float, q_mscfd: float, depth_ft: float,
+                tubing_id_in: float, t_wh_degf: float, t_bh_degf: float,
+                sg: float = 0.65, friction: Optional[float] = None) -> float:
+    """Flowing bottomhole pressure from a FLOWING tubing-head pressure.
+
+        p_wf^2 = exp(s) * p_tf^2
+                 + 25 * sg * f * q^2 * Tbar^2 * zbar^2 * (exp(s) - 1) / (s * d^5)
+
+    with q in MMscf/d, Tbar in degR, d in inches. Same averaging as the static
+    case, plus a friction term. Two warnings that matter more than the formula:
+
+    1. This is a FLOWING pressure. It equals the reservoir pressure minus the
+       drawdown, and drawdown moves with rate. It is a deliverability
+       measurement, not a material-balance one. Only if the rate has been
+       steady is the offset steady, and even then it is an offset of unknown
+       size -- the p/z intercept it implies is biased low.
+    2. It assumes a single-phase gas column. A well making water badly enough
+       to accumulate liquid in the tubing has a heavier column than this
+       predicts, so the computed p_wf is too LOW -- and the error grows exactly
+       as the well loads up, which reads as depletion that is not there.
+
+    Drop the rate to zero and this reduces to `static_gas_column`, as it must.
+    """
+    if not p_tf_psia > 0:
+        raise ValueError(f"tubing-head pressure must be positive, got {p_tf_psia}")
+    if q_mscfd < 0:
+        raise ValueError(f"rate must not be negative, got {q_mscfd}")
+    if depth_ft < 0:
+        raise ValueError(f"depth must not be negative, got {depth_ft}")
+    f = _friction_factor(tubing_id_in) if friction is None else friction
+    if not f > 0:
+        raise ValueError(f"friction factor must be positive, got {f}")
+    q = q_mscfd / 1000.0                       # MMscf/d
+    tbar = (t_wh_degf + t_bh_degf) / 2.0 + 459.67
+    if tbar <= 0:
+        raise ValueError("average temperature is below absolute zero")
+    if depth_ft == 0 or q == 0:
+        # no column and no flow: the friction term has a removable 0/0 in s,
+        # and the static routine already handles the weight-only case
+        return static_gas_column(p_tf_psia, depth_ft, t_wh_degf, t_bh_degf, sg)
+    p = p_tf_psia
+    for _ in range(200):
+        zbar = z_factor((p_tf_psia + p) / 2.0, tbar - 459.67, sg)
+        s = 0.0375 * sg * depth_ft / (tbar * zbar)
+        es = math.exp(s)
+        p2 = (es * p_tf_psia ** 2
+              + 25.0 * sg * f * q * q * tbar * tbar * zbar * zbar * (es - 1.0)
+              / (s * tubing_id_in ** 5))
+        pn = math.sqrt(p2)
+        if abs(pn - p) < 1e-9 * max(pn, 1.0):
+            return pn
+        p = pn
+    return p
 
 
 def volumetric_gas_in_place(area_acres: float, net_pay_ft: float, porosity: float,
