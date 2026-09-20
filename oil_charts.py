@@ -144,6 +144,39 @@ def _set_log_range(fig, series: Sequence[np.ndarray],
         fig.update_yaxes(tickformat="~g", exponentformat="power")
 
 
+def _set_linear_range(fig, x_vals: Sequence[np.ndarray] = (),
+                     y_vals: Sequence[np.ndarray] = (),
+                     pad: float = 0.06) -> None:
+    """Fix a linear axis range from the data, for the same reason as the log.
+
+    On the Monte Carlo scatter, 727 of 800 realisations shared one life
+    (42.75 years, the horizon) and plotly autoranged the y axis to 41 - so
+    ninety-one per cent of the points were clipped out of a chart whose whole
+    purpose is to show where the mass of the realisations sits. Setting the
+    range from the numbers costs three lines and cannot do that.
+    """
+    def _rng(vals):
+        allv: List[float] = []
+        for a in vals:
+            arr = np.asarray(a, dtype=float)
+            arr = arr[np.isfinite(arr)]
+            if arr.size:
+                allv.extend([float(arr.min()), float(arr.max())])
+        if not allv:
+            return None
+        lo, hi = min(allv), max(allv)
+        span = hi - lo
+        if span <= 0:                      # every point identical
+            span = max(abs(hi), 1.0) * 0.05
+        return [lo - pad * span, hi + pad * span]
+
+    rx, ry = _rng(x_vals), _rng(y_vals)
+    if rx:
+        fig.update_xaxes(range=rx)
+    if ry:
+        fig.update_yaxes(range=ry)
+
+
 def _limit_line(fig, y: float, text: str, theme: str,
                 position: str = "top right") -> None:
     """A limit line, labelled with its value.
@@ -219,78 +252,72 @@ def chart_rate_time(res, theme: str = "light", log_y: bool = True,
     return fig
 
 
-def chart_three_streams(res, theme: str = "light",
-                        height: int = 520) -> go.Figure:
-    """Oil, gas and water on three stacked panels, never on twin axes."""
-    from plotly.subplots import make_subplots
+STREAMS = {
+    "oil":   dict(hist="q_oil", fcst="q_oil_stbd",   slot=0, unit="STB/d",
+                  label="Oil rate"),
+    "gas":   dict(hist="q_gas", fcst="q_gas_mscfd",  slot=2, unit="Mscf/d",
+                  label="Gas rate"),
+    "water": dict(hist="q_water", fcst="q_water_stbd", slot=3, unit="STB/d",
+                  label="Water rate"),
+}
+
+
+def chart_stream(res, stream: str = "oil", theme: str = "light",
+                 height: int = 340) -> go.Figure:
+    """One produced stream: history and forecast, on its own axes.
+
+    These were one figure with three stacked panels. Plotly puts a subplot's
+    title above its plotting area and the shared x-axis title below it, so at
+    three rows each panel's title collided with the axis label of the panel
+    above - "Time on production (years)" printed three times, twice on top of
+    something else. Three separate figures also let each stream keep its own
+    height and be placed where it is wanted, instead of all three being
+    hostage to one layout.
+    """
     c = palette(theme)
+    spec = STREAMS.get(stream, STREAMS["oil"])
     d, tb = res.data, res.forecast.table
+    colour = c["series"][spec["slot"]]
+    hist = getattr(d, spec["hist"])
     dates = _dates(res)
-    fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                        vertical_spacing=0.07,
-                        subplot_titles=("Oil (STB/d)", "Gas (Mscf/d)",
-                                        "Water (STB/d)"))
-    series = [(d.q_oil, "q_oil_stbd", c["series"][0], "Oil", "STB/d"),
-              (d.q_gas, "q_gas_mscfd", c["series"][2], "Gas", "Mscf/d"),
-              (d.q_water, "q_water_stbd", c["series"][3], "Water", "STB/d")]
-    for i, (hist, col, colour, name, unit) in enumerate(series, start=1):
+
+    fig = go.Figure()
+    # Only the oil panel carries the decline-fit band: the fit is fitted to
+    # the oil rate, and marking the gas or water chart "excluded from the
+    # fit" would say those months were dropped from a fit they were never
+    # part of.
+    if stream == "oil":
+        _shade_excluded(fig, res, theme)
+
+    fig.add_trace(go.Scatter(
+        x=d.t / DAYS_PER_YEAR, y=hist, mode="markers", name="Measured",
+        marker=_marker(colour, theme, size=6),
+        customdata=dates,
+        hovertemplate=("<b>%{customdata}</b><br>%{y:,.0f} " + spec["unit"]
+                       + "<extra></extra>")))
+    if len(tb) > 1:
         fig.add_trace(go.Scatter(
-            x=d.t / DAYS_PER_YEAR, y=hist, mode="markers", name=name,
-            marker=_marker(colour, theme, size=5.5), showlegend=False,
-            customdata=dates,
-            hovertemplate=("<b>%{customdata}</b><br>" + name
-                           + " %{y:,.0f} " + unit + "<extra></extra>")),
-            row=i, col=1)
-        if len(tb) > 1:
-            fig.add_trace(go.Scatter(
-                x=tb["t_years"], y=tb[col], mode="lines",
-                name=f"{name} forecast",
-                line=dict(width=2.0, color=colour, dash="dash"),
-                showlegend=False,
-                hovertemplate=("Year %{x:.1f}<br>" + name
-                               + " %{y:,.0f} " + unit + "<extra></extra>")),
-                row=i, col=1)
+            x=tb["t_years"], y=tb[spec["fcst"]], mode="lines", name="Forecast",
+            line=dict(width=2.4, color=colour, dash="dash"),
+            hovertemplate=("Year %{x:.1f}<br>%{y:,.0f} " + spec["unit"]
+                           + "<extra></extra>")))
 
-    # The shading goes on AFTER the traces. Plotly silently drops a shape
-    # scoped to a row that has no data in it yet - no error, no warning, the
-    # shape simply is not in the figure - so shading first left three panels
-    # unshaded and nothing to say why.
-    # Only the oil panel. The decline fit is fitted to the oil rate; marking
-    # the gas and water panels "excluded from the fit" would say those
-    # months were dropped from a fit they were never part of.
-    _shade_excluded(fig, res, theme, row=1)
+    lim = float("nan")
+    if stream == "oil":
+        lim = res.limits.get("q_econ_stbd", float("nan"))
+        _limit_line(fig, lim, f"economic limit {lim:,.0f} STB/d", theme)
+    elif stream == "water":
+        lim = res.limits.get("q_water_econ_stbd", float("nan"))
+        if np.isfinite(lim) and lim > 0:
+            _limit_line(fig, lim, f"handling limit {lim:,.0f} STB/d", theme)
 
-    q_econ = res.limits.get("q_econ_stbd", float("nan"))
-    if np.isfinite(q_econ) and q_econ > 0:
-        fig.add_hline(y=q_econ, row=1, col=1,
-                      line=dict(color=c["critical"], width=1.2, dash="dot"))
-    qw_lim = res.limits.get("q_water_econ_stbd", float("nan"))
-    if np.isfinite(qw_lim) and qw_lim > 0:
-        fig.add_hline(y=qw_lim, row=3, col=1,
-                      line=dict(color=c["critical"], width=1.2, dash="dot"))
-
-    fig = _layout(fig, theme, f"Three streams -- {res.well}",
-                  "Time on production (years)", "", height=height,
-                  legend=False)
-    fig.update_yaxes(type="log", dtick=1, tickformat=",d",
-                     exponentformat="none")
-    for i, (hist, col, colour, name, unit) in enumerate(series, start=1):
-        lims = ([q_econ] if i == 1 else [qw_lim] if i == 3 else [])
-        vals = [hist] + ([tb[col].to_numpy(float)] if len(tb) > 1 else [])
-        a = np.concatenate([np.asarray(v, float) for v in vals])
-        a = a[np.isfinite(a) & (a > 0)]
-        if not a.size:
-            continue
-        lo, hi = float(a.min()), float(a.max())
-        for L in lims:
-            if np.isfinite(L) and L > 0:
-                lo, hi = min(lo, float(L)), max(hi, float(L))
-        lo_d, hi_d = math.log10(lo) - 0.12, math.log10(hi) + 0.12
-        if hi_d - lo_d > 6.0:
-            lo_d = hi_d - 6.0
-        fig.update_yaxes(range=[lo_d, hi_d], row=i, col=1)
-    for ann in fig.layout.annotations:
-        ann.font.update(size=11, color=c["ink2"], family=FONT)
+    fig = _layout(fig, theme, f"{spec['label']} -- {res.well}",
+                  "Time on production (years)",
+                  f"{spec['label']} ({spec['unit']})",
+                  log_y=True, height=height)
+    vals = [hist] + ([tb[spec["fcst"]].to_numpy(float)] if len(tb) > 1 else [])
+    _set_log_range(fig, vals, limits=[lim])
+    fig.update_layout(hovermode="x unified")
     return fig
 
 
@@ -708,11 +735,17 @@ def chart_eur_cdf(res, column: str = "eur_oil_mstb",
         line=dict(width=2.4, color=c["series"][0]),
         hovertemplate="%{x:,.0f}<br>%{y:.0f} % chance of exceeding"
                       "<extra></extra>"))
-    for val, name in ((p90, "P90"), (p50, "P50"), (p10, "P10")):
+    # P90, P50 and P10 can sit within a percent of each other on a tight
+    # distribution, so their labels are staggered vertically rather than all
+    # placed at the top, where they overprinted into an unreadable smear.
+    for (val, name), ypos in zip(((p90, "P90"), (p50, "P50"), (p10, "P10")),
+                                 (0.98, 0.88, 0.78)):
         fig.add_vline(x=float(val),
-                      line=dict(color=c["muted"], width=1.2, dash="dot"),
-                      annotation_text=f"{name} {val:,.0f}",
-                      annotation_font=dict(size=10, color=c["muted"]))
+                      line=dict(color=c["muted"], width=1.2, dash="dot"))
+        fig.add_annotation(
+            x=float(val), y=ypos, xref="x", yref="paper", text=name,
+            showarrow=False, xanchor="left", xshift=3,
+            font=dict(size=10, color=c["muted"], family=FONT))
     det = getattr(res.forecast,
                   {"eur_oil_mstb": "eur_oil_mstb",
                    "eur_gas_mmscf": "eur_gas_mmscf",
@@ -754,5 +787,8 @@ def chart_mc_scatter(res, x: str, y: str, xlabel: str, ylabel: str,
             marker=dict(size=5, color=c["series"][0], opacity=0.5,
                         line=dict(width=0.6, color=c["surface"])),
             hovertemplate="%{x:,.0f}<br>%{y:,.1f}<extra></extra>"))
-    return _layout(fig, theme, "", xlabel, ylabel, height=height,
-                   legend=bool(colour_by))
+    fig = _layout(fig, theme, "", xlabel, ylabel, height=height,
+                  legend=bool(colour_by))
+    _set_linear_range(fig, [res.mc[x].to_numpy(float)],
+                      [res.mc[y].to_numpy(float)])
+    return fig

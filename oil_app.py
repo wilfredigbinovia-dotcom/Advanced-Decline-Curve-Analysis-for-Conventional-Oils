@@ -98,6 +98,12 @@ def mono(text: str) -> None:
     st.code(text, language=None)
 
 
+# Every chart that shares a row with another is given the SAME height.
+# Streamlit columns do not equalise their contents, so two figures at 440 and
+# 400 render as one tall chart beside one short one, which reads as though
+# the taller one matters more.
+PANEL_H = 420
+
 PASTE_ROWS = 60
 PASTE_COLS = ["date", "q_oil", "q_gas", "q_water", "days_on", "p_res", "p_wf"]
 
@@ -462,19 +468,26 @@ with tabs[0]:
     with c1:
         st.markdown("#### QC")
         mono(res.data.qc.summary())
+    with c2:
         st.markdown("#### PVT")
         mono(res.pvt.summary())
-    with c2:
-        show_fig(oc.chart_three_streams(res, theme), key="streams")
+    st.markdown("#### Produced streams")
+    # Three charts rather than three stacked panels: equal width, equal
+    # height, and each one's axis titles its own.
+    s1, s2, s3 = st.columns(3)
+    for col, which in ((s1, "oil"), (s2, "gas"), (s3, "water")):
+        with col:
+            show_fig(oc.chart_stream(res, which, theme, height=PANEL_H),
+                     key=f"stream_{which}")
     show_df(res.data.df.head(500))
 
 # ---------------------------------------------------------------- Decline fit
 with tabs[1]:
     c1, c2 = st.columns(2)
     with c1:
-        show_fig(oc.chart_rate_time(res, theme), key="rate_t")
+        show_fig(oc.chart_rate_time(res, theme, height=PANEL_H), key="rate_t")
     with c2:
-        show_fig(oc.chart_rate_cum(res, theme), key="rate_cum")
+        show_fig(oc.chart_rate_cum(res, theme, height=PANEL_H), key="rate_cum")
     st.markdown("#### Model ranking")
     note("Lower AICc is better, but statistics is not physics: prefer the "
          "model whose late-time behaviour you can defend. A parameter shown "
@@ -494,14 +507,14 @@ with tabs[1]:
 with tabs[2]:
     c1, c2 = st.columns(2)
     with c1:
-        show_fig(oc.chart_gor(res, theme), key="gor")
+        show_fig(oc.chart_gor(res, theme, height=PANEL_H), key="gor")
         mono(res.gor_diag.summary() if res.gor_diag else "not run")
-        show_fig(oc.chart_pi(res, theme), key="pi")
+        show_fig(oc.chart_pi(res, theme, height=PANEL_H), key="pi")
         mono(res.pi_diag.summary() if res.pi_diag else "not run")
     with c2:
-        show_fig(oc.chart_chan(res, theme), key="chan")
+        show_fig(oc.chart_chan(res, theme, height=PANEL_H), key="chan")
         mono(res.water_diag.summary() if res.water_diag else "not run")
-        show_fig(oc.chart_water(res, theme), key="wcut")
+        show_fig(oc.chart_water(res, theme, height=PANEL_H), key="wcut")
     st.markdown("#### Producing ratios carried into the forecast")
     mono(res.gor_model.summary() + "\n" + res.wor_model.summary())
 
@@ -513,9 +526,9 @@ with tabs[3]:
     else:
         c1, c2 = st.columns(2)
         with c1:
-            show_fig(oc.chart_havlena_odeh(res, theme), key="ho")
+            show_fig(oc.chart_havlena_odeh(res, theme, height=PANEL_H), key="ho")
         with c2:
-            show_fig(oc.chart_apparent_n(res, theme), key="appn")
+            show_fig(oc.chart_apparent_n(res, theme, height=PANEL_H), key="appn")
         mono(res.matbal.summary())
         if res.matbal.ho_table is not None:
             with st.expander("Survey-by-survey table"):
@@ -530,7 +543,7 @@ with tabs[4]:
     m[2].metric("Life, yr", f"{fc.economic_life_years:,.1f}")
     m[3].metric("Ends on", fc.abandonment_reason)
     mono(fc.summary())
-    show_fig(oc.chart_rate_time(res, theme, height=440), key="fcst_rate")
+    show_fig(oc.chart_rate_time(res, theme, height=480), key="fcst_rate")
     with st.expander("Forecast table"):
         show_df(fc.table)
 
@@ -542,12 +555,12 @@ with tabs[5]:
         mono(od.summarise_oil_mc(res.mc, res.forecast, res.n_mc_requested))
         c1, c2 = st.columns(2)
         with c1:
-            show_fig(oc.chart_eur_cdf(res, "eur_oil_mstb", "EUR oil, Mstb",
-                                      theme), key="cdf_oil")
+            show_fig(oc.chart_eur_cdf(res, "eur_oil_mstb", "EUR oil (Mstb)",
+                                      theme, height=PANEL_H), key="cdf_oil")
         with c2:
             show_fig(oc.chart_mc_scatter(res, "eur_oil_mstb", "life_years",
-                                         "EUR oil, Mstb", "life, yr", theme),
-                     key="sc1")
+                                         "EUR oil (Mstb)", "Life (years)",
+                                         theme, height=PANEL_H), key="sc1")
         if "model" in res.mc:
             mix = res.mc["model"].value_counts(normalize=True)
             if len(mix) > 1:

@@ -3513,15 +3513,39 @@ def summarise_oil_mc(mc: pd.DataFrame, deterministic: OilForecast,
             "deterministic figure as one member of\n"
             "                      the family.")
     if not (p90 <= det <= p10):
-        # This is the check that caught the gas tool twice. A deterministic
-        # case outside its own P90-P10 means the realisations are not being
-        # run under the same rules as the base case - almost always a
-        # constraint that one honours and the other does not.
-        lines.append(
-            "                      THE DETERMINISTIC CASE LIES OUTSIDE ITS "
-            "OWN P90-P10. The realisations\n                      are not "
-            "being run under the same constraints as the base case; do not "
-            "quote\n                      these percentiles.")
+        # This check caught the gas tool twice, when the cause was a
+        # constraint the realisations honoured and the base case did not. It
+        # now has a second, entirely legitimate cause: the base case uses the
+        # SELECTED decline curve while the realisations use the weighted
+        # ensemble, and where those disagree the base case can sit outside
+        # its own band without anything being wrong. Reporting the old
+        # message there would send a reader hunting for a constraint mismatch
+        # that does not exist.
+        det_model = getattr(deterministic, "model_name", None) or ""
+        mix_share = 0.0
+        top_model = ""
+        if "model" in mc and len(mc):
+            vc = mc["model"].value_counts(normalize=True)
+            top_model = str(vc.index[0])
+            det_model = det_model or top_model
+            mix_share = float(vc.iloc[0])
+        if top_model and mix_share >= 0.5:
+            lines.append(
+                f"                      The base case lies outside its own "
+                f"P90-P10. {100 * mix_share:.0f} % of realisations use\n"
+                f"                      {top_model}, which the weights "
+                f"prefer, while the base case uses the curve you\n"
+                f"                      selected. That is a disagreement "
+                f"about WHICH CURVE, not about the limits -\n"
+                f"                      read P50 as the central case, or set "
+                f"the model selection to 'auto'.")
+        else:
+            lines.append(
+                "                      THE DETERMINISTIC CASE LIES OUTSIDE "
+                "ITS OWN P90-P10, and the model mix\n                      "
+                "does not explain it. The realisations are not being run "
+                "under the same\n                      constraints as the "
+                "base case; do not quote these percentiles.")
     band = 100.0 * (p10 - p90) / 2.0 / max(p50, 1e-9)
     # Where nearly every realisation ends on the same limit, the spread stops
     # being a spread on the EUR and becomes a spread on the parameters of
