@@ -313,7 +313,14 @@ def pvt_physicality_warnings(pvt: "OilPVT", n: int = 400) -> List[str]:
     # every fluid - including a textbook black oil - as peaking 6 psi off.
     step = float(p[1] - p[0]) if len(p) > 1 else 1.0
     i_pk = int(np.argmax(bo))
-    if abs(float(p[i_pk]) - pb) > 2.5 * step:
+    # A reservoir SATURATED at discovery has its bubble point at or above the
+    # initial pressure, so within the pressure range that exists Bo peaks at
+    # the top of that range and nowhere else. Checking against a bubble point
+    # outside the swept interval flagged a perfectly ordinary saturated fluid
+    # as unphysical.
+    if pb >= float(pvt.p_init) - 2.5 * step:
+        pass
+    elif abs(float(p[i_pk]) - pb) > 2.5 * step:
         out.append(
             f"Bo does not peak at the bubble point: its maximum "
             f"{float(np.max(bo)):.4f} is at {p[i_pk]:,.0f} psia, "
@@ -3815,6 +3822,10 @@ class OilWellResult:
     mc: Optional[pd.DataFrame] = None
     n_mc_requested: int = 0
     settings: Dict = field(default_factory=dict)
+    # The same limits as `settings`, unformatted. The settings block is for a
+    # reader and holds strings like "150 STB/d"; a chart needs the number, and
+    # parsing it back out of the prose would be absurd.
+    limits: Dict[str, float] = field(default_factory=dict)
 
     def _window_block(self) -> str:
         """How much the rate trend depends on where the window starts."""
@@ -4129,7 +4140,22 @@ def analyse_oil_well(df: "pd.DataFrame | OilProductionData",
                         if run_monte_carlo else "off"),
     }
 
+    limits = {
+        "q_econ_stbd": float(q_econ_stbd),
+        "water_cut_econ": (float(water_cut_econ) if water_cut_econ else
+                           float("nan")),
+        "q_water_econ_stbd": (float(q_water_econ_stbd) if q_water_econ_stbd
+                              else float("nan")),
+        "p_abandon_psia": (float(p_abandon_psia) if p_abandon_psia
+                           else float("nan")),
+        "n_ooip_stb": (float(n_cap) if n_cap else float("nan")),
+        "n_ceiling_stb": (float(n_hard_max) if n_hard_max else float("nan")),
+        "fit_start_days": (float(t_lo) if t_lo else float("nan")),
+        "t_max_years": float(t_max_years),
+    }
+
     return OilWellResult(
+        limits=limits,
         well=well, data=data, pvt=pvt, model_table=table, fits=fits,
         best_fit=best, gor_model=gor_model, wor_model=wor_model,
         forecast=forecast, gor_diag=gor_diag, water_diag=water_diag,

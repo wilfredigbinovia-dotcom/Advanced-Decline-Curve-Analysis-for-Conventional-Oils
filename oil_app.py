@@ -501,10 +501,7 @@ with tabs[2]:
     with c2:
         show_fig(oc.chart_chan(res, theme), key="chan")
         mono(res.water_diag.summary() if res.water_diag else "not run")
-        show_fig(oc.chart_water(res, theme,
-                                water_cut_limit=(wcut_lim / 100.0
-                                                 if wcut_lim > 0 else 0.0)),
-                 key="wcut")
+        show_fig(oc.chart_water(res, theme), key="wcut")
     st.markdown("#### Producing ratios carried into the forecast")
     mono(res.gor_model.summary() + "\n" + res.wor_model.summary())
 

@@ -12,9 +12,28 @@ read as one system:
   * No chart has two y-axes. Oil, gas and water are different measures on
     different scales; overlaying them on twin axes lets you manufacture any
     correlation you like by choosing the scales.
-  * Hover is on. A production chart that cannot tell you the rate and date
-    under the cursor is a picture, not a tool.
   * Light and dark are both selected, not an automatic inversion.
+
+Four things every chart here does, which a plot of the same numbers need not:
+
+  EXCLUDED DATA IS SHADED, NOT MARKED. A thin line saying "fit starts" tells
+  you a boundary exists; a shaded band tells you how much of the record is on
+  the far side of it. On a well with three years of plateau that is the
+  difference between a detail and the main fact about the fit.
+
+  LIMITS ARE DRAWN AND LABELLED WITH THEIR VALUE. The economic rate, the
+  water-cut limit, the oil in place: these are what end the well, and a
+  forecast read against them is a different picture from a forecast read
+  against nothing.
+
+  HOVER CARRIES THE DATE AND THE COMPANION STREAMS. A point on an oil-rate
+  chart is a month, and what matters about that month is usually the GOR or
+  the water cut next to it. Reading the rate alone and then hunting for the
+  date in a table is how a reader stops checking.
+
+  MARKERS ARE OUTLINED IN THE SURFACE COLOUR. Overlapping points on a dark
+  background merge into a single blob without it; the outline is what keeps a
+  cluster readable as a cluster.
 
 Every public function takes an `OilWellResult` (or plain arrays) plus `theme`,
 and returns a `plotly.graph_objects.Figure`.
@@ -23,7 +42,8 @@ and returns a `plotly.graph_objects.Figure`.
 
 from __future__ import annotations
 
-from typing import Optional
+import math
+from typing import List, Optional, Sequence
 
 import numpy as np
 import pandas as pd
@@ -34,167 +54,380 @@ from oil_dca import DAYS_PER_YEAR, SCF_PER_MSCF, STB_PER_MSTB
 
 
 # ------------------------------------------------------------------------------
+# Shared furniture
+# ------------------------------------------------------------------------------
+
+def _dates(res) -> np.ndarray:
+    """Month labels for hover, aligned to the QC'd record."""
+    d = res.data.df
+    if "date" in d.columns:
+        return d["date"].dt.strftime("%b %Y").to_numpy()
+    return np.array([""] * len(d))
+
+
+def _marker(colour: str, theme: str, size: float = 7.0,
+            opacity: float = 1.0) -> dict:
+    c = palette(theme)
+    return dict(size=size, color=colour, opacity=opacity,
+                line=dict(width=1.2, color=c["surface"]))
+
+
+def _shade_excluded(fig, res, theme: str, x_is_years: bool = True,
+                    row: Optional[int] = None) -> None:
+    """Shade the part of the record the decline fit was not shown."""
+    c = palette(theme)
+    t0 = res.limits.get("fit_start_days", float("nan"))
+    if not (np.isfinite(t0) and t0 > 0):
+        return
+    t_start = float(res.data.t[0])
+    if t0 <= t_start:
+        return
+    kw = dict(fillcolor=c["band"], line_width=0, layer="below",
+              annotation_text="excluded from the fit",
+              annotation_position="top left",
+              annotation_font=dict(size=10, color=c["muted"]))
+    if row is not None:
+        kw["row"] = row
+        kw["col"] = 1
+        kw.pop("annotation_text", None)
+        kw.pop("annotation_position", None)
+        kw.pop("annotation_font", None)
+    if x_is_years:
+        fig.add_vrect(x0=t_start / DAYS_PER_YEAR, x1=t0 / DAYS_PER_YEAR, **kw)
+    else:
+        np_at = float(np.interp(t0, res.data.t, res.data.Np))
+        fig.add_vrect(x0=float(res.data.Np[0]) / 1.0e6, x1=np_at / 1.0e6, **kw)
+
+
+def _set_log_range(fig, series: Sequence[np.ndarray],
+                   limits: Sequence[float] = (), pad_decades: float = 0.12,
+                   max_decades: float = 6.0) -> None:
+    """Fix the log y range from the data, rather than leaving it to autorange.
+
+    Two of these charts autoranged to 10^20 on data spanning 248 to 5,440
+    STB/d - eighteen empty decades with the well squashed into the bottom
+    line of the plot. The trigger was an economic-limit line sitting two
+    decades below the data; the chart whose limit line was scoped to a
+    subplot row was unaffected, which is what makes it plotly's autorange
+    rather than the numbers.
+
+    Chasing that is not worth it when the range is better set explicitly in
+    any case. A rate chart should be framed by the rates, with the limit line
+    included only far enough to be visible - a limit six decades below the
+    data is a fact about the limit, not a reason to draw six empty decades.
+    """
+    vals: List[float] = []
+    for arr in series:
+        a = np.asarray(arr, dtype=float)
+        a = a[np.isfinite(a) & (a > 0)]
+        if a.size:
+            vals.extend([float(a.min()), float(a.max())])
+    if not vals:
+        return
+    lo, hi = min(vals), max(vals)
+    for L in limits:
+        if np.isfinite(L) and L > 0:
+            lo, hi = min(lo, float(L)), max(hi, float(L))
+    lo_d = math.log10(lo) - pad_decades
+    hi_d = math.log10(hi) + pad_decades
+    # Never draw more decades than the eye can use. Clamped from the TOP so
+    # the recent, low rates - the part a forecast is read from - keep their
+    # resolution.
+    if hi_d - lo_d > max_decades:
+        lo_d = hi_d - max_decades
+    fig.update_yaxes(range=[lo_d, hi_d])
+    # The integer tick format inherited from the shared layout is right for
+    # rates in the thousands and wrong for anything below 1: on the Chan plot,
+    # where WOR' runs from 1e-6 to 1, every decade label rounded to "0" and
+    # the axis shipped with six identical ticks.
+    if lo < 10.0:
+        fig.update_yaxes(tickformat="~g", exponentformat="power")
+
+
+def _limit_line(fig, y: float, text: str, theme: str,
+                position: str = "top right") -> None:
+    """A limit line, labelled with its value.
+
+    The label sits ABOVE the line by default. Below it, on a limit near the
+    bottom of the axis, the text was clipped by the plot edge and the chart
+    shipped with an unexplained red dotted line across it.
+    """
+    c = palette(theme)
+    if not (np.isfinite(y) and y > 0):
+        return
+    fig.add_hline(y=float(y), line=dict(color=c["critical"], width=1.4,
+                                        dash="dot"),
+                  annotation_text=text, annotation_position=position,
+                  annotation_font=dict(size=10, color=c["critical"]))
+
+
+# ------------------------------------------------------------------------------
 # Rates
 # ------------------------------------------------------------------------------
 
 def chart_rate_time(res, theme: str = "light", log_y: bool = True,
-                    height: int = 400) -> go.Figure:
-    """Oil rate history, the fitted model, and the forecast."""
+                    height: int = 440) -> go.Figure:
+    """Oil rate: history, the fitted model, the forecast, and what ends it."""
     c = palette(theme)
-    d, fc = res.data, res.forecast
-    t_hist = d.t / DAYS_PER_YEAR
+    d, fc = res.data, res.forecast.table
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=t_hist, y=d.q_oil, mode="markers", name="oil, measured",
-        marker=dict(size=4, color=c["series"][0], opacity=0.75),
-        hovertemplate="%{x:.2f} yr<br>%{y:,.0f} STB/d<extra></extra>"))
+    _shade_excluded(fig, res, theme)
 
-    # The fitted curve is drawn only over the window it was fitted to. Drawing
-    # it across the plateau as well would show a model apparently missing data
-    # it was never asked to match, and invite the reader to distrust a fit
-    # that is doing exactly what it was told.
-    t_fit = res.best_fit.t_fit
-    if t_fit is not None and len(t_fit):
-        grid = np.linspace(float(np.min(t_fit)), float(np.max(t_fit)), 400)
+    dates = _dates(res)
+    fig.add_trace(go.Scatter(
+        x=d.t / DAYS_PER_YEAR, y=d.q_oil, mode="markers", name="Oil",
+        marker=_marker(c["series"][0], theme),
+        customdata=np.stack([dates, d.gor, 100.0 * d.water_cut], axis=-1),
+        hovertemplate=("<b>%{customdata[0]}</b><br>"
+                       "Oil %{y:,.0f} STB/d<br>"
+                       "GOR %{customdata[1]:,.0f} scf/STB<br>"
+                       "Water cut %{customdata[2]:.1f} %<extra></extra>")))
+
+    # The fitted curve is drawn only over the window it was fitted to. Drawn
+    # across the plateau as well it would look like a model missing data it
+    # was never asked to match, and invite a reader to distrust a fit that is
+    # doing exactly what it was told.
+    tf = res.best_fit.t_fit
+    if tf is not None and len(tf):
+        grid = np.linspace(float(np.min(tf)), float(np.max(tf)), 400)
         fig.add_trace(go.Scatter(
             x=grid / DAYS_PER_YEAR, y=res.best_fit.model.rate(grid),
             mode="lines", name=f"{res.best_fit.model_name} fit",
-            line=dict(width=2, color=c["series"][1]),
-            hovertemplate="%{x:.2f} yr<br>%{y:,.0f} STB/d<extra></extra>"))
+            line=dict(width=2.4, color=c["series"][1]),
+            hovertemplate="Fit %{y:,.0f} STB/d<extra></extra>"))
 
-    tb = fc.table
-    if len(tb) > 1:
+    if len(fc) > 1:
         fig.add_trace(go.Scatter(
-            x=tb["t_years"], y=tb["q_oil_stbd"], mode="lines",
-            name="forecast", line=dict(width=2, color=c["series"][1],
-                                       dash="dash"),
-            hovertemplate="%{x:.2f} yr<br>%{y:,.0f} STB/d<extra></extra>"))
-    if d.qc.fit_start_days:
-        fig.add_vline(x=float(d.qc.fit_start_days) / DAYS_PER_YEAR,
-                      line=dict(color=c["muted"], width=1, dash="dot"),
-                      annotation_text="fit starts",
-                      annotation_font=dict(size=10, color=c["muted"]))
-    return _layout(fig, theme, f"Oil rate -- {res.well}", "years on production",
-                   "oil rate, STB/d", log_y=log_y, height=height)
+            x=fc["t_years"], y=fc["q_oil_stbd"], mode="lines", name="Forecast",
+            line=dict(width=2.4, color=c["series"][1], dash="dash"),
+            customdata=np.stack([fc["gor_scf_per_stb"],
+                                 100.0 * fc["water_cut"]], axis=-1),
+            hovertemplate=("Year %{x:.1f}<br>Oil %{y:,.0f} STB/d<br>"
+                           "GOR %{customdata[0]:,.0f} scf/STB<br>"
+                           "Water cut %{customdata[1]:.1f} %<extra></extra>")))
+
+    q_econ = res.limits.get("q_econ_stbd", float("nan"))
+    _limit_line(fig, q_econ, f"economic limit {q_econ:,.0f} STB/d", theme)
+
+    _layout(fig, theme, f"Oil rate: history, fit and forecast -- {res.well}",
+            "Time on production (years)", "Oil rate (STB/d)",
+            log_y=log_y, height=height)
+    if log_y:
+        _set_log_range(fig, [d.q_oil, fc["q_oil_stbd"].to_numpy(float)],
+                       limits=[q_econ])
+    fig.update_layout(hovermode="x unified")
+    return fig
 
 
 def chart_three_streams(res, theme: str = "light",
-                        height: int = 420) -> go.Figure:
+                        height: int = 520) -> go.Figure:
     """Oil, gas and water on three stacked panels, never on twin axes."""
     from plotly.subplots import make_subplots
     c = palette(theme)
     d, tb = res.data, res.forecast.table
+    dates = _dates(res)
     fig = make_subplots(rows=3, cols=1, shared_xaxes=True,
-                        vertical_spacing=0.06,
-                        subplot_titles=("oil, STB/d", "gas, Mscf/d",
-                                        "water, STB/d"))
-    series = [(d.q_oil, "q_oil_stbd", c["series"][0], "oil"),
-              (d.q_gas, "q_gas_mscfd", c["series"][2], "gas"),
-              (d.q_water, "q_water_stbd", c["series"][3], "water")]
-    for i, (hist, col, colour, name) in enumerate(series, start=1):
+                        vertical_spacing=0.07,
+                        subplot_titles=("Oil (STB/d)", "Gas (Mscf/d)",
+                                        "Water (STB/d)"))
+    series = [(d.q_oil, "q_oil_stbd", c["series"][0], "Oil", "STB/d"),
+              (d.q_gas, "q_gas_mscfd", c["series"][2], "Gas", "Mscf/d"),
+              (d.q_water, "q_water_stbd", c["series"][3], "Water", "STB/d")]
+    for i, (hist, col, colour, name, unit) in enumerate(series, start=1):
         fig.add_trace(go.Scatter(
             x=d.t / DAYS_PER_YEAR, y=hist, mode="markers", name=name,
-            marker=dict(size=3.5, color=colour, opacity=0.75),
-            showlegend=False,
-            hovertemplate="%{x:.2f} yr<br>%{y:,.0f}<extra></extra>"),
+            marker=_marker(colour, theme, size=5.5), showlegend=False,
+            customdata=dates,
+            hovertemplate=("<b>%{customdata}</b><br>" + name
+                           + " %{y:,.0f} " + unit + "<extra></extra>")),
             row=i, col=1)
         if len(tb) > 1:
             fig.add_trace(go.Scatter(
-                x=tb["t_years"], y=tb[col], mode="lines", name=f"{name} fcst",
-                line=dict(width=1.8, color=colour, dash="dash"),
+                x=tb["t_years"], y=tb[col], mode="lines",
+                name=f"{name} forecast",
+                line=dict(width=2.0, color=colour, dash="dash"),
                 showlegend=False,
-                hovertemplate="%{x:.2f} yr<br>%{y:,.0f}<extra></extra>"),
+                hovertemplate=("Year %{x:.1f}<br>" + name
+                               + " %{y:,.0f} " + unit + "<extra></extra>")),
                 row=i, col=1)
+
+    # The shading goes on AFTER the traces. Plotly silently drops a shape
+    # scoped to a row that has no data in it yet - no error, no warning, the
+    # shape simply is not in the figure - so shading first left three panels
+    # unshaded and nothing to say why.
+    # Only the oil panel. The decline fit is fitted to the oil rate; marking
+    # the gas and water panels "excluded from the fit" would say those
+    # months were dropped from a fit they were never part of.
+    _shade_excluded(fig, res, theme, row=1)
+
+    q_econ = res.limits.get("q_econ_stbd", float("nan"))
+    if np.isfinite(q_econ) and q_econ > 0:
+        fig.add_hline(y=q_econ, row=1, col=1,
+                      line=dict(color=c["critical"], width=1.2, dash="dot"))
+    qw_lim = res.limits.get("q_water_econ_stbd", float("nan"))
+    if np.isfinite(qw_lim) and qw_lim > 0:
+        fig.add_hline(y=qw_lim, row=3, col=1,
+                      line=dict(color=c["critical"], width=1.2, dash="dot"))
+
     fig = _layout(fig, theme, f"Three streams -- {res.well}",
-                  "years on production", "", height=height, legend=False)
+                  "Time on production (years)", "", height=height,
+                  legend=False)
     fig.update_yaxes(type="log", dtick=1, tickformat=",d",
                      exponentformat="none")
+    for i, (hist, col, colour, name, unit) in enumerate(series, start=1):
+        lims = ([q_econ] if i == 1 else [qw_lim] if i == 3 else [])
+        vals = [hist] + ([tb[col].to_numpy(float)] if len(tb) > 1 else [])
+        a = np.concatenate([np.asarray(v, float) for v in vals])
+        a = a[np.isfinite(a) & (a > 0)]
+        if not a.size:
+            continue
+        lo, hi = float(a.min()), float(a.max())
+        for L in lims:
+            if np.isfinite(L) and L > 0:
+                lo, hi = min(lo, float(L)), max(hi, float(L))
+        lo_d, hi_d = math.log10(lo) - 0.12, math.log10(hi) + 0.12
+        if hi_d - lo_d > 6.0:
+            lo_d = hi_d - 6.0
+        fig.update_yaxes(range=[lo_d, hi_d], row=i, col=1)
     for ann in fig.layout.annotations:
         ann.font.update(size=11, color=c["ink2"], family=FONT)
     return fig
 
 
-def chart_rate_cum(res, theme: str = "light", height: int = 380) -> go.Figure:
+def chart_rate_cum(res, theme: str = "light", height: int = 400) -> go.Figure:
     """Oil rate against cumulative oil - the plot that shows the EUR."""
     c = palette(theme)
     d, tb = res.data, res.forecast.table
     fig = go.Figure()
+    _shade_excluded(fig, res, theme, x_is_years=False)
+    dates = _dates(res)
+
     fig.add_trace(go.Scatter(
-        x=d.Np / 1.0e6, y=d.q_oil, mode="markers", name="measured",
-        marker=dict(size=4, color=c["series"][0], opacity=0.75),
-        hovertemplate="%{x:,.2f} MMstb<br>%{y:,.0f} STB/d<extra></extra>"))
+        x=d.Np / 1.0e6, y=d.q_oil, mode="markers", name="Oil",
+        marker=_marker(c["series"][0], theme),
+        customdata=np.stack([dates, d.t / DAYS_PER_YEAR], axis=-1),
+        hovertemplate=("<b>%{customdata[0]}</b> (%{customdata[1]:.1f} yr)<br>"
+                       "Np %{x:,.2f} MMstb<br>Oil %{y:,.0f} STB/d"
+                       "<extra></extra>")))
     if len(tb) > 1:
         fig.add_trace(go.Scatter(
             x=tb["Np_mstb"] / 1.0e3, y=tb["q_oil_stbd"], mode="lines",
-            name="forecast", line=dict(width=2, color=c["series"][1],
-                                       dash="dash"),
-            hovertemplate="%{x:,.2f} MMstb<br>%{y:,.0f} STB/d<extra></extra>"))
-    mb = res.matbal
-    if mb is not None and mb.trend_ok and np.isfinite(mb.n_ooip_stb):
-        fig.add_vline(x=float(mb.n_ooip_stb) / 1.0e6,
-                      line=dict(color=c["critical"], width=1.2, dash="dot"),
-                      annotation_text="N from the balance",
-                      annotation_font=dict(size=10, color=c["critical"]))
-    return _layout(fig, theme, f"Oil rate against cumulative -- {res.well}",
-                   "cumulative oil, MMstb", "oil rate, STB/d",
-                   log_y=True, height=height)
+            name="Forecast",
+            line=dict(width=2.4, color=c["series"][1], dash="dash"),
+            hovertemplate=("Np %{x:,.2f} MMstb<br>Oil %{y:,.0f} STB/d"
+                           "<extra></extra>")))
+
+    # The oil-in-place line is drawn only when it is near enough to the data
+    # to be worth the width. On one well the cap sat at 71 MMstb against a
+    # forecast reaching 28, so three quarters of the plot was empty space
+    # holding one dotted line; the number is more useful as a caption.
+    n_cap = res.limits.get("n_ooip_stb", float("nan"))
+    x_max = max(float(np.nanmax(d.Np)),
+                float(tb["Np_mstb"].max()) * 1.0e3 if len(tb) else 0.0)
+    if np.isfinite(n_cap) and n_cap > 0:
+        if n_cap <= 1.35 * x_max:
+            fig.add_vline(x=n_cap / 1.0e6,
+                          line=dict(color=c["critical"], width=1.4,
+                                    dash="dot"),
+                          annotation_text=f"oil in place "
+                                          f"{n_cap / 1e6:,.1f} MMstb",
+                          annotation_font=dict(size=10, color=c["critical"]))
+        else:
+            fig.add_annotation(
+                text=f"oil in place {n_cap / 1e6:,.1f} MMstb - off scale to "
+                     f"the right",
+                showarrow=False, xref="paper", yref="paper", x=0.98, y=0.06,
+                xanchor="right",
+                font=dict(size=10, color=c["critical"], family=FONT))
+            fig.update_xaxes(range=[-0.03 * x_max / 1.0e6,
+                                    1.05 * x_max / 1.0e6])
+    q_econ = res.limits.get("q_econ_stbd", float("nan"))
+    _limit_line(fig, q_econ, f"economic limit {q_econ:,.0f} STB/d", theme)
+
+    fig = _layout(fig, theme,
+                  f"Oil rate against cumulative -- {res.well}",
+                  "Cumulative oil (MMstb)", "Oil rate (STB/d)",
+                  log_y=True, height=height)
+    _set_log_range(fig, [d.q_oil, tb["q_oil_stbd"].to_numpy(float)],
+                   limits=[q_econ])
+    return fig
 
 
 # ------------------------------------------------------------------------------
 # Diagnostics
 # ------------------------------------------------------------------------------
 
-def chart_gor(res, theme: str = "light", height: int = 400) -> go.Figure:
+def chart_gor(res, theme: str = "light", height: int = 420) -> go.Figure:
     """Producing GOR against cumulative oil, with Rsi, the break and the peak."""
     c = palette(theme)
     d, tb = res.data, res.forecast.table
+    dates = _dates(res)
     fig = go.Figure()
+
+    g = res.gor_diag
+    if g is not None and g.ok and g.broke and g.break_np_stb:
+        # Everything left of the break is above the bubble point: the GOR
+        # there is Rsi and carries no information about free gas. Shading it
+        # says which part of the record the rising limb actually is.
+        fig.add_vrect(x0=float(d.Np[0]) / 1.0e6,
+                      x1=float(g.break_np_stb) / 1.0e6,
+                      fillcolor=c["band"], line_width=0, layer="below",
+                      annotation_text="above the bubble point",
+                      annotation_position="bottom left",
+                      annotation_font=dict(size=10, color=c["muted"]))
+
     fig.add_trace(go.Scatter(
-        x=d.Np / 1.0e6, y=d.gor, mode="markers", name="producing GOR",
-        marker=dict(size=4, color=c["series"][2], opacity=0.75),
-        hovertemplate="%{x:,.2f} MMstb<br>%{y:,.0f} scf/STB<extra></extra>"))
-    fig.add_hline(y=float(res.pvt.rsi),
-                  line=dict(color=c["muted"], width=1.2, dash="dash"),
-                  annotation_text="Rsi",
-                  annotation_font=dict(size=10, color=c["muted"]))
+        x=d.Np / 1.0e6, y=d.gor, mode="markers", name="Producing GOR",
+        marker=_marker(c["series"][2], theme),
+        customdata=np.stack([dates, d.q_oil], axis=-1),
+        hovertemplate=("<b>%{customdata[0]}</b><br>Np %{x:,.2f} MMstb<br>"
+                       "GOR %{y:,.0f} scf/STB<br>"
+                       "Oil %{customdata[1]:,.0f} STB/d<extra></extra>")))
+
     if len(tb) > 1:
         fig.add_trace(go.Scatter(
             x=tb["Np_mstb"] / 1.0e3, y=tb["gor_scf_per_stb"], mode="lines",
-            name="GOR model", line=dict(width=2, color=c["series"][1],
-                                        dash="dash"),
-            hovertemplate="%{x:,.2f} MMstb<br>%{y:,.0f} scf/STB<extra></extra>"))
-    g = res.gor_diag
+            name=f"GOR model ({res.gor_model.kind})",
+            line=dict(width=2.4, color=c["series"][1], dash="dash"),
+            hovertemplate=("Np %{x:,.2f} MMstb<br>GOR %{y:,.0f} scf/STB"
+                           "<extra></extra>")))
+
+    fig.add_hline(y=float(res.pvt.rsi),
+                  line=dict(color=c["muted"], width=1.4, dash="dash"),
+                  annotation_text=f"Rsi {res.pvt.rsi:,.0f} scf/STB",
+                  annotation_position="bottom right",
+                  annotation_font=dict(size=10, color=c["muted"]))
     if g is not None and g.ok:
         if g.broke and g.break_np_stb:
             fig.add_vline(x=float(g.break_np_stb) / 1.0e6,
-                          line=dict(color=c["critical"], width=1.2,
+                          line=dict(color=c["critical"], width=1.4,
                                     dash="dot"),
                           annotation_text="bubble point",
                           annotation_font=dict(size=10, color=c["critical"]))
         if g.peaked and g.peak_np_stb:
             fig.add_vline(x=float(g.peak_np_stb) / 1.0e6,
-                          line=dict(color=c["series"][4], width=1.2,
+                          line=dict(color=c["series"][4], width=1.4,
                                     dash="dot"),
                           annotation_text="GOR peak",
+                          annotation_position="top right",
                           annotation_font=dict(size=10, color=c["series"][4]))
     return _layout(fig, theme, f"Producing GOR -- {res.well}",
-                   "cumulative oil, MMstb", "GOR, scf/STB", height=height)
+                   "Cumulative oil (MMstb)", "GOR (scf/STB)", height=height)
 
 
-def chart_chan(res, theme: str = "light", height: int = 400) -> go.Figure:
+def chart_chan(res, theme: str = "light", height: int = 420) -> go.Figure:
     """Chan's WOR and WOR' against time since breakthrough, log-log.
 
     The abscissa is time SINCE BREAKTHROUGH rather than Chan's total producing
     time. On a well that breaks through late, every WOR rising from zero at
     breakthrough carries a 1/(t - t_bt) factor in its local slope, so on a
     total-time axis it looks like it is flattening whatever the mechanism -
-    which is how an ordinary linear water cut read as coning with a WOR slope
-    of +16. The two axes coincide when breakthrough is early, which is the
-    case Chan's own field examples come from.
+    which is how an ordinary linear water cut once read as coning with a WOR
+    slope of +16. The two axes coincide when breakthrough is early, which is
+    the case Chan's own field examples come from.
     """
     c = palette(theme)
-    d = res.data
-    wd = res.water_diag
+    d, wd = res.data, res.water_diag
     qo, qw, t = d.q_oil, d.q_water, d.t
     ok = (qo > 0) & (qw > 0) & (t > 0)
     if int(ok.sum()) < 8 or wd is None or not wd.ok:
@@ -202,97 +435,145 @@ def chart_chan(res, theme: str = "light", height: int = 400) -> go.Figure:
                       height)
     wor = qw[ok] / qo[ok]
     tt = t[ok]
+    lab = _dates(res)[ok]
     t_bt = (float(wd.breakthrough_t_days) if wd.breakthrough_t_days
             else float(tt[0]))
     x = np.maximum(tt - t_bt, 1e-6)
     keep = x > 1e-3
-    x, wor = x[keep], wor[keep]
+    x, wor, lab = x[keep], wor[keep], lab[keep]
     if len(x) < 6:
         return _empty(theme, "not enough post-breakthrough history", height)
+
     sm = wor.copy()
     if len(wor) >= 5:
         sm[1:-1] = np.array([np.median(wor[j - 1:j + 2])
                              for j in range(1, len(wor) - 1)])
     dwor = np.gradient(sm, x)
+
     fig = go.Figure()
     fig.add_trace(go.Scatter(
         x=x, y=wor, mode="markers", name="WOR",
-        marker=dict(size=4.5, color=c["series"][3], opacity=0.8),
-        hovertemplate="%{x:,.0f} d after breakthrough<br>WOR "
-                      "%{y:,.3f}<extra></extra>"))
+        marker=_marker(c["series"][3], theme),
+        customdata=lab,
+        hovertemplate=("<b>%{customdata}</b><br>%{x:,.0f} d after "
+                       "breakthrough<br>WOR %{y:,.3f}<extra></extra>")))
     pos = dwor > 0
     fig.add_trace(go.Scatter(
         x=x[pos], y=dwor[pos], mode="markers", name="WOR'",
-        marker=dict(size=4.5, color=c["series"][4], opacity=0.8,
-                    symbol="diamond"),
-        hovertemplate="%{x:,.0f} d<br>WOR' %{y:.3g}/d<extra></extra>"))
+        marker=dict(size=6, color=c["series"][4], symbol="diamond",
+                    line=dict(width=1.0, color=c["surface"])),
+        hovertemplate="%{x:,.0f} d<br>WOR' %{y:.3g} /d<extra></extra>"))
+
+    # The window the slopes were actually fitted over, so a reader can see
+    # that the verdict rests on the late part and not on breakthrough itself.
+    if wd.n_fitted and wd.n_fitted < len(x):
+        fig.add_vrect(x0=float(x[0]), x1=float(x[len(x) - wd.n_fitted]),
+                      fillcolor=c["band"], line_width=0, layer="below",
+                      annotation_text="transition, not fitted",
+                      annotation_position="top left",
+                      annotation_font=dict(size=10, color=c["muted"]))
+
     fig = _layout(fig, theme, f"Chan water diagnostic -- {res.well}",
-                  "days since breakthrough", "WOR and WOR'",
+                  "Days since breakthrough", "WOR and WOR'",
                   log_y=True, height=height)
-    fig.update_xaxes(type="log")
+    _set_log_range(fig, [wor, dwor[pos]])
+    # The X axis needs the same treatment as the Y. Left to autorange on a
+    # log scale it came back spanning 1 to 10^35 days - the whole record
+    # compressed into the first pixel - because WOR' values near zero drag
+    # the companion axis with them.
+    fig.update_xaxes(type="log", dtick=1, tickformat="~g",
+                     exponentformat="none",
+                     range=[math.log10(max(float(np.min(x)), 1.0)) - 0.1,
+                            math.log10(float(np.max(x))) + 0.1],
+                     minor=dict(showgrid=True, gridcolor=c["grid"],
+                                gridwidth=1))
     fig.add_annotation(
         text=wd.mechanism.split(" -")[0], showarrow=False, xref="paper",
         yref="paper", x=0.02, y=0.06, xanchor="left",
-        font=dict(size=12, color=c["ink"], family=FONT))
+        font=dict(size=13, color=c["ink"], family=FONT))
     return fig
 
 
-def chart_pi(res, theme: str = "light", height: int = 380) -> go.Figure:
+def chart_pi(res, theme: str = "light", height: int = 400) -> go.Figure:
     """Productivity index over time, with its source labelled."""
     c = palette(theme)
     pi = res.pi_diag
     if pi is None or not pi.ok or pi.t_days is None:
-        reason = (pi.reason if pi is not None and pi.reason
-                  else "no productivity index available")
-        return _empty(theme, reason, height)
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=np.asarray(pi.t_days) / DAYS_PER_YEAR, y=np.asarray(pi.pi),
-        mode="markers", name="PI",
-        marker=dict(size=4.5, color=c["series"][0], opacity=0.8),
-        hovertemplate="%{x:.2f} yr<br>%{y:,.2f} STB/d/psi<extra></extra>"))
+        return _empty(theme, (pi.reason if pi is not None and pi.reason
+                              else "no productivity index available"), height)
     t_yr = np.asarray(pi.t_days) / DAYS_PER_YEAR
+    vals = np.asarray(pi.pi)
+    fig = go.Figure()
+    # No "excluded from the fit" band here. That band marks where the DECLINE
+    # fit starts, and the productivity index has nothing to do with the
+    # decline fit - it is computed on every flowing test in the record.
+    # Shading it implied a whole third of these points had been discarded
+    # when none of them had.
+    fig.add_trace(go.Scatter(
+        x=t_yr, y=vals, mode="markers", name="PI",
+        marker=_marker(c["series"][0], theme, size=6.5),
+        customdata=np.asarray(pi.p_avg),
+        hovertemplate=("%{x:.2f} yr<br>PI %{y:,.2f} STB/d/psi<br>"
+                       "p_avg %{customdata:,.0f} psia<extra></extra>")))
     if np.isfinite(pi.trend_pct_per_year) and len(t_yr) > 1:
         k = np.log1p(pi.trend_pct_per_year / 100.0)
-        anchor = float(np.median(np.asarray(pi.pi)))
+        anchor = float(np.median(vals))
         t_mid = float(np.median(t_yr))
         fig.add_trace(go.Scatter(
             x=t_yr, y=anchor * np.exp(k * (t_yr - t_mid)), mode="lines",
             name=f"{pi.trend_pct_per_year:+.1f} %/yr",
-            line=dict(width=2, color=c["series"][1])))
+            line=dict(width=2.4, color=c["series"][1])))
     fig = _layout(fig, theme, f"Productivity index -- {res.well}",
-                  "years on production", "PI, STB/d/psi", height=height)
+                  "Time on production (years)", "PI (STB/d/psi)",
+                  height=height)
     fig.add_annotation(
         text=f"p_avg from {pi.p_avg_source}", showarrow=False, xref="paper",
         yref="paper", x=0.02, y=0.06, xanchor="left",
         font=dict(size=10, color=c["muted"], family=FONT))
+    fig.update_layout(hovermode="x unified")
     return fig
 
 
-def chart_water(res, theme: str = "light", water_cut_limit: float = 0.0,
-                height: int = 380) -> go.Figure:
+def chart_water(res, theme: str = "light", height: int = 400) -> go.Figure:
     """Water cut history and forecast, against the limit that ends the well."""
     c = palette(theme)
     d, tb = res.data, res.forecast.table
+    dates = _dates(res)
     fig = go.Figure()
+    # The band that matters on a water chart is the DRY period, not the
+    # decline-fit window: the WOR model is fitted to wet months only, so the
+    # months before breakthrough are the ones excluded here.
+    wd = res.water_diag
+    if wd is not None and wd.ok and wd.breakthrough_t_days:
+        fig.add_vrect(x0=float(d.t[0]) / DAYS_PER_YEAR,
+                      x1=float(wd.breakthrough_t_days) / DAYS_PER_YEAR,
+                      fillcolor=c["band"], line_width=0, layer="below",
+                      annotation_text="before breakthrough",
+                      annotation_position="top left",
+                      annotation_font=dict(size=10, color=c["muted"]))
     fig.add_trace(go.Scatter(
         x=d.t / DAYS_PER_YEAR, y=100.0 * d.water_cut, mode="markers",
-        name="measured", marker=dict(size=4, color=c["series"][3],
-                                     opacity=0.75),
-        hovertemplate="%{x:.2f} yr<br>%{y:.1f} %<extra></extra>"))
+        name="Water cut", marker=_marker(c["series"][3], theme),
+        customdata=np.stack([dates, d.q_water, d.q_oil], axis=-1),
+        hovertemplate=("<b>%{customdata[0]}</b><br>Water cut %{y:.1f} %<br>"
+                       "Water %{customdata[1]:,.0f} STB/d<br>"
+                       "Oil %{customdata[2]:,.0f} STB/d<extra></extra>")))
     if len(tb) > 1:
         fig.add_trace(go.Scatter(
             x=tb["t_years"], y=100.0 * tb["water_cut"], mode="lines",
-            name="forecast", line=dict(width=2, color=c["series"][1],
-                                       dash="dash"),
-            hovertemplate="%{x:.2f} yr<br>%{y:.1f} %<extra></extra>"))
-    if water_cut_limit and water_cut_limit > 0:
-        fig.add_hline(y=100.0 * water_cut_limit,
-                      line=dict(color=c["critical"], width=1.2, dash="dash"),
-                      annotation_text="limit",
-                      annotation_font=dict(size=10, color=c["critical"]))
-    return _layout(fig, theme, f"Water cut -- {res.well}",
-                   "years on production", "water cut, %", height=height)
+            name=f"Forecast ({res.wor_model.kind})",
+            line=dict(width=2.4, color=c["series"][1], dash="dash"),
+            hovertemplate="Year %{x:.1f}<br>Water cut %{y:.1f} %"
+                          "<extra></extra>"))
+    lim = res.limits.get("water_cut_econ", float("nan"))
+    if np.isfinite(lim) and lim > 0:
+        _limit_line(fig, 100.0 * lim, f"limit {100 * lim:.0f} %", theme,
+                    position="top right")
+    fig = _layout(fig, theme, f"Water cut -- {res.well}",
+                  "Time on production (years)", "Water cut (%)",
+                  height=height)
+    fig.update_layout(hovermode="x unified")
+    return fig
 
 
 # ------------------------------------------------------------------------------
@@ -300,7 +581,7 @@ def chart_water(res, theme: str = "light", water_cut_limit: float = 0.0,
 # ------------------------------------------------------------------------------
 
 def chart_havlena_odeh(res, theme: str = "light",
-                       height: int = 400) -> go.Figure:
+                       height: int = 420) -> go.Figure:
     """F against Et. A straight line through the origin is a closed tank."""
     c = palette(theme)
     mb = res.matbal
@@ -309,28 +590,40 @@ def chart_havlena_odeh(res, theme: str = "light",
     tab = mb.ho_table
     et = tab["Et"].to_numpy(float)
     f = tab["F_rb"].to_numpy(float)
+    pr = (tab["p"].to_numpy(float) if "p" in tab
+          else np.full(len(et), np.nan))
+    npv = (tab["Np_stb"].to_numpy(float) if "Np_stb" in tab
+           else np.full(len(et), np.nan))
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=et, y=f / 1.0e6, mode="markers", name="surveys",
-        marker=dict(size=7, color=c["series"][0], opacity=0.85),
-        hovertemplate="Et %{x:.5f} rb/STB<br>F %{y:,.2f} MMrb<extra></extra>"))
+
     if np.isfinite(mb.n_ooip_stb) and len(et):
         xs = np.linspace(0.0, float(np.nanmax(et)) * 1.05, 50)
         fig.add_trace(go.Scatter(
             x=xs, y=mb.n_ooip_stb * xs / 1.0e6, mode="lines",
             name=f"N = {mb.n_ooip_mstb / 1e3:,.1f} MMstb",
-            line=dict(width=2, color=c["series"][1])))
+            line=dict(width=2.4, color=c["series"][1]),
+            hoverinfo="skip"))
     if np.isfinite(mb.n_ceiling_stb) and len(et):
         xs = np.linspace(0.0, float(np.nanmax(et)) * 1.05, 50)
         fig.add_trace(go.Scatter(
             x=xs, y=mb.n_ceiling_stb * xs / 1.0e6, mode="lines",
             name=f"ceiling min(F/Et) = {mb.n_ceiling_stb / 1e6:,.1f} MMstb",
-            line=dict(width=1.5, color=c["critical"], dash="dot")))
+            line=dict(width=1.6, color=c["critical"], dash="dot"),
+            hoverinfo="skip"))
+
+    fig.add_trace(go.Scatter(
+        x=et, y=f / 1.0e6, mode="markers", name="Surveys",
+        marker=_marker(c["series"][0], theme, size=9),
+        customdata=np.stack([pr, npv / 1.0e6], axis=-1),
+        hovertemplate=("p %{customdata[0]:,.0f} psia<br>"
+                       "Np %{customdata[1]:,.2f} MMstb<br>"
+                       "Et %{x:.5f} rb/STB<br>F %{y:,.2f} MMrb"
+                       "<extra></extra>")))
     return _layout(fig, theme, f"Havlena-Odeh -- {res.well}",
-                   "Et = Eo + m Eg + Efw, rb/STB", "F, MMrb", height=height)
+                   "Et = Eo + m Eg + Efw (rb/STB)", "F (MMrb)", height=height)
 
 
-def chart_apparent_n(res, theme: str = "light", height: int = 360) -> go.Figure:
+def chart_apparent_n(res, theme: str = "light", height: int = 380) -> go.Figure:
     """Apparent N survey by survey. Flat is a closed tank; rising is influx."""
     c = palette(theme)
     mb = res.matbal
@@ -340,28 +633,49 @@ def chart_apparent_n(res, theme: str = "light", height: int = 360) -> go.Figure:
     use = tab["apparent_N_usable"].to_numpy(bool)
     x = tab["Np_stb"].to_numpy(float)[use] / 1.0e6
     y = tab["apparent_N_stb"].to_numpy(float)[use] / 1.0e6
+    pr = (tab["p"].to_numpy(float)[use] if "p" in tab
+          else np.full(len(x), np.nan))
     if not len(x):
         return _empty(theme, "no survey has enough depletion to read F/Et",
                       height)
     fig = go.Figure()
+
+    # The band the drive verdict is read off. A closed tank keeps apparent N
+    # inside it; influx walks it out of the top.
+    if np.isfinite(mb.apparent_n_min_stb):
+        lo = mb.apparent_n_min_stb / 1.0e6
+        fig.add_hrect(y0=lo, y1=lo * 1.10, fillcolor=c["band"], line_width=0,
+                      layer="below", annotation_text="within 10 % of min",
+                      annotation_position="top left",
+                      annotation_font=dict(size=10, color=c["muted"]))
+
     fig.add_trace(go.Scatter(
         x=x, y=y, mode="lines+markers", name="apparent N = F/Et",
-        marker=dict(size=7, color=c["series"][0]),
-        line=dict(width=1.5, color=rgba(c["series"][0], 0.5)),
-        hovertemplate="Np %{x:,.2f} MMstb<br>F/Et %{y:,.1f} "
-                      "MMstb<extra></extra>"))
+        marker=_marker(c["series"][0], theme, size=8),
+        line=dict(width=1.6, color=rgba(c["series"][0], 0.5)),
+        customdata=pr,
+        hovertemplate=("Np %{x:,.2f} MMstb<br>p %{customdata:,.0f} psia<br>"
+                       "F/Et %{y:,.1f} MMstb<extra></extra>")))
     if np.isfinite(mb.n_ooip_stb):
         fig.add_hline(y=mb.n_ooip_stb / 1.0e6,
-                      line=dict(color=c["series"][1], width=1.5),
-                      annotation_text="fitted N",
+                      line=dict(color=c["series"][1], width=2.0),
+                      annotation_text=f"fitted N "
+                                      f"{mb.n_ooip_stb / 1e6:,.1f} MMstb",
                       annotation_font=dict(size=10, color=c["series"][1]))
     if np.isfinite(mb.n_ceiling_stb):
         fig.add_hline(y=mb.n_ceiling_stb / 1.0e6,
-                      line=dict(color=c["critical"], width=1.2, dash="dot"),
+                      line=dict(color=c["critical"], width=1.4, dash="dot"),
                       annotation_text="ceiling, We >= 0",
+                      annotation_position="bottom right",
                       annotation_font=dict(size=10, color=c["critical"]))
-    return _layout(fig, theme, f"Apparent oil in place -- {res.well}",
-                   "cumulative oil, MMstb", "F / Et, MMstb", height=height)
+    fig = _layout(fig, theme, f"Apparent oil in place -- {res.well}",
+                  "Cumulative oil (MMstb)", "F / Et (MMstb)", height=height)
+    if mb.drive:
+        fig.add_annotation(
+            text=mb.drive.split(" -")[0], showarrow=False, xref="paper",
+            yref="paper", x=0.02, y=0.06, xanchor="left",
+            font=dict(size=12, color=c["ink"], family=FONT))
+    return fig
 
 
 # ------------------------------------------------------------------------------
@@ -369,48 +683,76 @@ def chart_apparent_n(res, theme: str = "light", height: int = 360) -> go.Figure:
 # ------------------------------------------------------------------------------
 
 def chart_eur_cdf(res, column: str = "eur_oil_mstb",
-                  label: str = "EUR oil, Mstb", theme: str = "light",
-                  height: int = 380) -> go.Figure:
+                  label: str = "EUR oil (Mstb)", theme: str = "light",
+                  height: int = 400) -> go.Figure:
     """The sampled EUR distribution, with P90/P50/P10 and the base case."""
     c = palette(theme)
     if res.mc is None or not len(res.mc) or column not in res.mc:
         return _empty(theme, "Monte Carlo was not run", height)
     v = np.sort(res.mc[column].to_numpy(float))
+    v = v[np.isfinite(v)]
+    if not len(v):
+        return _empty(theme, "no finite realisations", height)
     cdf = np.arange(1, len(v) + 1) / len(v)
+    p90, p50, p10 = np.percentile(v, [10, 50, 90])
+
     fig = go.Figure()
+    # The P90-P10 band, shaded. The percentile markers alone leave the reader
+    # to hold three numbers in mind; the band is the range itself.
+    fig.add_vrect(x0=p90, x1=p10, fillcolor=c["band"], line_width=0,
+                  layer="below", annotation_text="P90 - P10",
+                  annotation_position="top left",
+                  annotation_font=dict(size=10, color=c["muted"]))
     fig.add_trace(go.Scatter(
-        x=v, y=100.0 * (1.0 - cdf), mode="lines", name="exceedance",
-        line=dict(width=2, color=c["series"][0]),
-        hovertemplate="%{x:,.0f}<br>%{y:.0f} % chance of "
-                      "exceeding<extra></extra>"))
-    for pct, name in ((10, "P90"), (50, "P50"), (90, "P10")):
-        fig.add_vline(x=float(np.percentile(v, pct)),
-                      line=dict(color=c["muted"], width=1, dash="dot"),
-                      annotation_text=name,
+        x=v, y=100.0 * (1.0 - cdf), mode="lines", name="Exceedance",
+        line=dict(width=2.4, color=c["series"][0]),
+        hovertemplate="%{x:,.0f}<br>%{y:.0f} % chance of exceeding"
+                      "<extra></extra>"))
+    for val, name in ((p90, "P90"), (p50, "P50"), (p10, "P10")):
+        fig.add_vline(x=float(val),
+                      line=dict(color=c["muted"], width=1.2, dash="dot"),
+                      annotation_text=f"{name} {val:,.0f}",
                       annotation_font=dict(size=10, color=c["muted"]))
-    det = getattr(res.forecast, {"eur_oil_mstb": "eur_oil_mstb",
-                                 "eur_gas_mmscf": "eur_gas_mmscf",
-                                 "eur_water_mstb": "eur_water_mstb"}
-                  .get(column, "eur_oil_mstb"), float("nan"))
+    det = getattr(res.forecast,
+                  {"eur_oil_mstb": "eur_oil_mstb",
+                   "eur_gas_mmscf": "eur_gas_mmscf",
+                   "eur_water_mstb": "eur_water_mstb"}.get(column,
+                                                           "eur_oil_mstb"),
+                  float("nan"))
     if np.isfinite(det):
+        pctl = 100.0 * float(np.mean(v <= det))
         fig.add_vline(x=float(det),
-                      line=dict(color=c["critical"], width=1.5),
-                      annotation_text="base case",
+                      line=dict(color=c["critical"], width=1.8),
+                      annotation_text=f"base case ({pctl:.0f}th)",
+                      annotation_position="bottom right",
                       annotation_font=dict(size=10, color=c["critical"]))
     return _layout(fig, theme, f"EUR exceedance -- {res.well}", label,
-                   "chance of exceeding, %", height=height)
+                   "Chance of exceeding (%)", height=height)
 
 
 def chart_mc_scatter(res, x: str, y: str, xlabel: str, ylabel: str,
-                     theme: str = "light", height: int = 360) -> go.Figure:
+                     theme: str = "light", colour_by: Optional[str] = "model",
+                     height: int = 380) -> go.Figure:
     """Two sampled quantities against each other, to show what drives what."""
     c = palette(theme)
     if res.mc is None or not len(res.mc) or x not in res.mc or y not in res.mc:
         return _empty(theme, "Monte Carlo was not run", height)
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=res.mc[x], y=res.mc[y], mode="markers", name="realisations",
-        marker=dict(size=4, color=c["series"][0], opacity=0.45),
-        hovertemplate="%{x:,.1f}<br>%{y:,.1f}<extra></extra>"))
+    # Colouring by the sampled decline is the whole point: it shows whether
+    # the spread is the parameters moving or the choice of curve.
+    if colour_by and colour_by in res.mc and res.mc[colour_by].nunique() > 1:
+        for i, (name, grp) in enumerate(res.mc.groupby(colour_by)):
+            fig.add_trace(go.Scatter(
+                x=grp[x], y=grp[y], mode="markers", name=str(name),
+                marker=dict(size=5, color=c["series"][i % len(c["series"])],
+                            opacity=0.55,
+                            line=dict(width=0.6, color=c["surface"])),
+                hovertemplate="%{x:,.0f}<br>%{y:,.1f}<extra></extra>"))
+    else:
+        fig.add_trace(go.Scatter(
+            x=res.mc[x], y=res.mc[y], mode="markers", name="Realisations",
+            marker=dict(size=5, color=c["series"][0], opacity=0.5,
+                        line=dict(width=0.6, color=c["surface"])),
+            hovertemplate="%{x:,.0f}<br>%{y:,.1f}<extra></extra>"))
     return _layout(fig, theme, "", xlabel, ylabel, height=height,
-                   legend=False)
+                   legend=bool(colour_by))
