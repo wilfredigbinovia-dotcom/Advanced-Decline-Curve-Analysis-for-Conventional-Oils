@@ -1715,6 +1715,757 @@ class OilProductionData:
         return obj
 
 
+# ==============================================================================
+# SECTION 3b -- AQUIFER HISTORY MATCH
+# ==============================================================================
+#
+# Havlena-Odeh above fits N to a straight line and treats influx as something
+# to detect and refuse. This section does what MBAL's regression does instead:
+# it SIMULATES the tank forward through the production history with an
+# aquifer attached, predicts the pressure at every survey, and adjusts N (and
+# optionally m) and the aquifer until the predictions match.
+#
+# The difference from MBAL is in what is regressed. A radial Van Everdingen-
+# Hurst aquifer is described by porosity, thickness, encroachment angle,
+# reservoir radius, permeability, water viscosity, total compressibility and
+# the outer/inner radius ratio - but the pressure history only ever sees three
+# combinations of them:
+#
+#     U   = 1.119 phi ct h ro^2 (theta/360)       rb/psi     aquifer constant
+#     t_c = phi mu_w ct ro^2 / (0.006328 k)       days       tD = t / t_c
+#     reD = r_aquifer / r_o                                  aquifer size
+#
+# Regressing on phi, h and theta separately regresses on directions in which
+# the answer does not change at all; a 170-degree aquifer 125 ft thick gives
+# exactly the influx of an 85-degree one 250 ft thick. So the regression is on
+# U, t_c and reD (or, for Fetkovich, on Wei and a time constant), and rock
+# properties are only used afterwards to translate the answer - with the
+# statement that only their products are determined.
+#
+# The other difference is that the fit refuses to run without enough surveys
+# to leave degrees of freedom over. A regression with as many parameters as
+# surveys always fits perfectly, and a perfect fit there says nothing about N.
+
+AQUIFER_KINDS = ("none", "fetkovich", "radial")
+VEH_U_CONST = 1.119          # rb/(psi ft^3) * ft^3 ... U = 1.119 phi ct h ro^2 f
+VEH_TD_CONST = 0.006328      # tD = 0.006328 k t / (phi mu ct ro^2), t in days
+AQ_MIN_DOF = 3               # surveys beyond the parameter count, at least
+AQ_MAX_STEPS = 100           # simulation steps across the history
+AQ_MAX_RANGE_RATIO = 3.0     # 95 % range wider than this: N not determined
+_IND = "\n" + " " * 22
+
+
+def _stehfest_weights(n: int = 12) -> np.ndarray:
+    """Gaver-Stehfest weights for numerical Laplace inversion."""
+    h = n // 2
+    v = np.zeros(n)
+    for i in range(1, n + 1):
+        s = 0.0
+        for k in range((i + 1) // 2, min(i, h) + 1):
+            s += (k ** h * math.factorial(2 * k)
+                  / (math.factorial(h - k) * math.factorial(k)
+                     * math.factorial(k - 1) * math.factorial(i - k)
+                     * math.factorial(2 * k - i)))
+        v[i - 1] = (-1) ** (h + i) * s
+    return v
+
+
+_STEHFEST = _stehfest_weights(12)
+
+
+def veh_wd(td: np.ndarray, red: float = float("inf")) -> np.ndarray:
+    """Van Everdingen-Hurst dimensionless cumulative influx, radial aquifer.
+
+    Constant-terminal-pressure solution with a no-flow outer boundary at
+    `red` (infinite if not finite), inverted from Laplace space by Stehfest.
+    The Bessel functions are the exponentially SCALED ones, arranged so that
+    no term overflows at large arguments: the unscaled I1(reD*sqrt(s)) passes
+    1e308 for reD*sqrt(s) above about 710, which a 20:1 aquifer at early
+    dimensionless time reaches immediately.
+    """
+    from scipy import special as sp
+    td = np.atleast_1d(np.asarray(td, dtype=float))
+    out = np.zeros_like(td)
+    pos = td > 0
+    if not pos.any():
+        return out
+    t = td[pos][:, None]
+    k = np.arange(1, len(_STEHFEST) + 1)[None, :]
+    s = k * math.log(2.0) / t
+    u = np.sqrt(s)
+    if not np.isfinite(red):
+        lap = sp.kve(1, u) / (s * u * sp.kve(0, u))
+    else:
+        a, b = u, float(red) * u
+        e = np.exp(2.0 * (a - b))
+        num = sp.ive(1, b) * sp.kve(1, a) - sp.kve(1, b) * sp.ive(1, a) * e
+        den = sp.ive(0, a) * sp.kve(1, b) * e + sp.kve(0, a) * sp.ive(1, b)
+        lap = num / (s * u * den)
+    val = math.log(2.0) / t[:, 0] * (lap @ _STEHFEST)
+    out[pos] = np.maximum(val, 0.0)
+    if np.isfinite(red):
+        out = np.minimum(out, 0.5 * (float(red) ** 2 - 1.0))
+    return out
+
+
+def _edwardson_wd(td: np.ndarray) -> np.ndarray:
+    """Edwardson et al. (1962) fit to the INFINITE radial WD, 0.01 <= tD <= 200.
+
+    Used only by the self-tests, as an independent check on the Stehfest
+    inversion above.
+    """
+    td = np.asarray(td, dtype=float)
+    r = np.sqrt(td)
+    return ((1.12838 * r + 1.19328 * td + 0.269872 * td * r
+             + 0.00855294 * td ** 2) / (1.0 + 0.616599 * r + 0.0413008 * td))
+
+
+@dataclass
+class _TankHistory:
+    """A production history on a uniform time grid, with PVT tabulated."""
+    t: np.ndarray            # (K+1,) days, t[0] = 0
+    dt: float
+    F: np.ndarray            # (K+1, G) withdrawal at each step, each pressure
+    pg: np.ndarray           # (G,) pressure grid, ascending
+    Eo: np.ndarray
+    Eg: np.ndarray
+    cefw: np.ndarray         # (G,) (cw Sw + cf)/(1 - Sw) * Boi * (pi - p)
+    p_init: float
+    np_end: float
+
+
+def _tank_history(t_days: np.ndarray, np_stb: np.ndarray, gp_scf: np.ndarray,
+                  wp_stb: np.ndarray, pvt: OilPVT, p_initial: float,
+                  t_end: float, n_steps: int = AQ_MAX_STEPS,
+                  n_grid: int = 500) -> _TankHistory:
+    t_days = np.asarray(t_days, float)
+    order = np.argsort(t_days)
+    tt = t_days[order]
+    cn = np.maximum.accumulate(np.nan_to_num(np.asarray(np_stb, float)[order]))
+    cg = np.maximum.accumulate(np.nan_to_num(np.asarray(gp_scf, float)[order]))
+    cw = (np.maximum.accumulate(np.nan_to_num(np.asarray(wp_stb, float)[order]))
+          if wp_stb is not None else np.zeros_like(tt))
+    # Cumulatives are zero at t = 0 (first production), which the record may
+    # not contain as a row.
+    tt = np.concatenate([[min(0.0, tt[0])], tt])
+    cn, cg, cw = (np.concatenate([[0.0], cn]), np.concatenate([[0.0], cg]),
+                  np.concatenate([[0.0], cw]))
+    K = int(max(20, min(n_steps, math.ceil(t_end / 30.4375))))
+    dt = float(t_end) / K
+    grid = dt * np.arange(K + 1)
+    npk = np.interp(grid, tt, cn)
+    gpk = np.interp(grid, tt, cg)
+    wpk = np.interp(grid, tt, cw)
+
+    p_floor = max(50.0, 0.03 * p_initial)
+    pg = np.linspace(p_floor, p_initial, int(n_grid))
+    bo, rs, bg, bt = pvt.bo(pg), pvt.rs(pg), pvt.bg(pg), pvt.bt(pg)
+    # The PVT is anchored on pvt.p_init; the balance on the p_initial the user
+    # gave. They are normally the same number.
+    boi = float(pvt.bo(np.array([p_initial]))[0])
+    bgi = float(pvt.bg(np.array([p_initial]))[0])
+    bti = float(pvt.bt(np.array([p_initial]))[0])
+    swc = pvt.sw_initial
+    with np.errstate(divide="ignore", invalid="ignore"):
+        rp = np.where(npk > 0, gpk / np.maximum(npk, 1e-12), 0.0)
+    F = (npk[:, None] * (bo[None, :] + (rp[:, None] - rs[None, :]) * bg[None, :])
+         + wpk[:, None] * pvt.bw)
+    Eo = bt - bti
+    Eg = boi * (bg / bgi - 1.0)
+    cefw = (boi * ((pvt.cw_per_psi * swc + pvt.cf_per_psi)
+                   / max(1.0 - swc, 1e-9)) * (p_initial - pg))
+    return _TankHistory(t=grid, dt=dt, F=F, pg=pg, Eo=Eo, Eg=Eg, cefw=cefw,
+                        p_init=float(p_initial), np_end=float(npk[-1]))
+
+
+def _simulate_tank(h: _TankHistory, n_stb: float, m: float, kind: str,
+                   a1: float = 0.0, a2: float = 1.0, a3: float = 2.0
+                   ) -> Tuple[np.ndarray, np.ndarray, bool]:
+    """Pressure and cumulative influx at every step of the history.
+
+    kind 'fetkovich': a1 = Wei (rb), a2 = tau = Wei / (J pi) (days)
+    kind 'radial'   : a1 = U (rb/psi), a2 = t_c (days), a3 = reD
+    kind 'none'     : a closed tank
+
+    Each step solves F(p) = N Et(p) + We(p) for the new pressure. We is linear
+    in the new pressure for both aquifers (Fetkovich through the interval's
+    mean pressure, Van Everdingen-Hurst through the last superposition
+    term), so the residual is formed on the whole pressure grid at once and
+    the root read off the sign change nearest the previous step's pressure.
+    Returns (p, We, hit_floor).
+    """
+    K = len(h.t) - 1
+    pi = h.p_init
+    E = n_stb * (h.Eo + m * h.Eg + (1.0 + m) * h.cefw)
+    p = np.full(K + 1, pi)
+    we = np.zeros(K + 1)
+    floor_hit = False
+    pg = h.pg
+    if kind == "fetkovich":
+        wei, tau = float(a1), float(a2)
+        f = 1.0 - math.exp(-h.dt / max(tau, 1e-9))
+    elif kind == "radial":
+        U, tc, red = float(a1), float(a2), float(a3)
+        wd = veh_wd(h.dt * np.arange(1, K + 1) / max(tc, 1e-12), red)
+        dps = np.zeros(K + 1)          # superposition pressure steps, known
+    for k in range(1, K + 1):
+        if kind == "fetkovich":
+            pa = pi * (1.0 - we[k - 1] / wei)
+            A = we[k - 1] + (wei / pi) * f * (pa - 0.5 * p[k - 1])
+            B = -(wei / pi) * f * 0.5
+        elif kind == "radial":
+            # We_k = U [ sum_{j<=k-2} dp_j WD(k-j) + dp_{k-1}(p_k) WD(1) ]
+            known = float(dps[:k - 1] @ wd[k - 1:0:-1]) if k >= 2 else 0.0
+            ref = p[k - 2] if k >= 2 else pi
+            A = U * (known + 0.5 * ref * wd[0])
+            B = -U * 0.5 * wd[0]
+        else:
+            A, B = 0.0, 0.0
+        R = h.F[k] - E - (A + B * pg)
+        sg = np.signbit(R)
+        cross = np.flatnonzero(sg[1:] != sg[:-1])
+        if cross.size:
+            r0, r1 = R[cross], R[cross + 1]
+            w = np.where(r1 == r0, 0.0, r0 / (r0 - r1))
+            roots = pg[cross] + w * (pg[cross + 1] - pg[cross])
+            pk = float(roots[np.argmin(np.abs(roots - p[k - 1]))])
+        elif R[0] > 0:
+            pk, floor_hit = float(pg[0]), True
+        else:
+            pk = float(pg[-1])
+        p[k] = pk
+        we[k] = max(A + B * pk, 0.0) if kind != "none" else 0.0
+        if kind == "radial":
+            # dp_{k-1} is now fully known.
+            dps[k - 1] = 0.5 * ((p[k - 2] if k >= 2 else pi) - pk)
+    return p, we, floor_hit
+
+
+@dataclass
+class AquiferMatch:
+    """A tank-plus-aquifer history match on the survey pressures."""
+    kind: str = "none"
+    ran: bool = False
+    refused_reason: str = ""
+    fit_m: bool = False
+    param_names: Tuple[str, ...] = ()
+    params: Dict[str, float] = field(default_factory=dict)
+    # One-sigma MULTIPLICATIVE factors for the log-parametrised quantities
+    # (x/÷), additive for m.
+    param_sigma: Dict[str, float] = field(default_factory=dict)
+    corr: Optional[pd.DataFrame] = None
+    n_obs: int = 0
+    n_par: int = 0
+    dof: int = 0
+    rms_psi: float = float("nan")
+    max_resid_psi: float = float("nan")
+    max_resid_t: float = float("nan")
+    n_stb: float = float("nan")
+    m: float = 0.0
+    n_range_stb: Tuple[float, float] = (float("nan"), float("nan"))
+    n_range_open: Tuple[bool, bool] = (False, False)
+    n_range_at_np: bool = False
+    p_initial: float = float("nan")
+    p_initial_source: str = ""
+    profile: Optional[pd.DataFrame] = None
+    we_to_date_rb: float = float("nan")
+    withdrawal_to_date_rb: float = float("nan")
+    n_ceiling_stb: float = float("nan")
+    floor_hit: bool = False
+    t_sim: Optional[np.ndarray] = None
+    p_sim: Optional[np.ndarray] = None
+    we_sim: Optional[np.ndarray] = None
+    p_closed: Optional[np.ndarray] = None
+    t_obs: Optional[np.ndarray] = None
+    p_obs: Optional[np.ndarray] = None
+    rock_note: str = ""
+    warnings_text: List[str] = field(default_factory=list)
+    n_ho_stb: float = float("nan")
+
+    @property
+    def accepted(self) -> bool:
+        return bool(self.ran and np.isfinite(self.n_stb) and self.n_stb > 0)
+
+    @property
+    def label(self) -> str:
+        return {"fetkovich": "FETKOVICH", "radial":
+                "RADIAL VAN EVERDINGEN-HURST", "none": "CLOSED TANK"}.get(
+                    self.kind, self.kind.upper())
+
+    def summary(self) -> str:
+        ind = "\n" + " " * 22
+        lines = [f"AQUIFER HISTORY MATCH ({self.label})"]
+        if not self.ran:
+            lines.append("  NOT RUN           : "
+                         + textwrap.fill(self.refused_reason, width=78)
+                         .replace("\n", ind))
+            return "\n".join(lines)
+        held = ("" if self.fit_m else f"   (m held at {self.m:.3f})")
+        lines += [
+            f"  regressed on      : {', '.join(self.param_names)}{held}",
+            f"  p_initial         : {self.p_initial:,.0f} psia "
+            f"({self.p_initial_source})",
+            f"  surveys matched   : {self.n_obs}, for {self.n_par} "
+            f"parameters - {self.dof} degrees of freedom left",
+            f"  pressure mismatch : RMS {self.rms_psi:,.1f} psi; largest "
+            f"{self.max_resid_psi:+,.1f} psi at day {self.max_resid_t:,.0f}"]
+        lo, hi = self.n_range_stb
+        rng = (("the oil already produced" if self.n_range_at_np
+                else "below the scan" if self.n_range_open[0]
+                else f"{lo / 1e6:,.1f}")
+               + " to "
+               + ("above the scan" if self.n_range_open[1]
+                  else f"{hi / 1e6:,.1f}"))
+        lines.append(
+            f"  OOIP (N)          : {self.n_stb / 1e6:,.2f} MMstb; 95 % range "
+            f"{rng} MMstb")
+        if (np.isfinite(lo) and lo > 0 and np.isfinite(hi)
+                and hi / lo > AQ_MAX_RANGE_RATIO):
+            lines.append(
+                f"  N NOT DETERMINED  : the 95 % range spans a factor of "
+                f"{hi / lo:,.1f}. Every N in it matches the surveys\n"
+                "                      as well as the point value does - "
+                "the aquifer takes up whatever N leaves.\n"
+                "                      Quote the range, not the number.")
+        if self.n_range_at_np:
+            lines.append(
+                "                      the lower end is the oil already "
+                "produced: the surveys cannot rule out\n"
+                "                      that the aquifer did nearly all the "
+                "work and N is barely more than Np.")
+        if (self.n_range_open[0] and not self.n_range_at_np) \
+                or self.n_range_open[1]:
+            lines.append(
+                "                      the range runs off the scan: these "
+                "surveys do not bound N on that side,\n"
+                "                      however good the match looks.")
+        if np.isfinite(self.n_ho_stb):
+            lines.append(
+                f"                      (Havlena-Odeh without an aquifer: "
+                f"{self.n_ho_stb / 1e6:,.2f} MMstb)")
+        units = {"Wei": ("MMrb", 1e6), "tau": ("days", 1.0),
+                 "U": ("rb/psi", 1.0), "t_c": ("days", 1.0),
+                 "reD": ("", 1.0), "m": ("", 1.0)}
+        for k in self.param_names:
+            if k == "N":
+                continue
+            v = self.params[k]
+            u, sc = units.get(k, ("", 1.0))
+            sig = self.param_sigma.get(k, float("nan"))
+            if k == "m":
+                bar = f" +/- {sig:.3f}" if np.isfinite(sig) else ""
+            elif np.isfinite(sig) and sig > 100.0:
+                bar = "  NOT DETERMINED (1-sigma factor above 100)"
+            else:
+                bar = (f"  x/÷ {sig:.2f} (1 sigma)" if np.isfinite(sig)
+                       else "")
+            lines.append(f"  {k:<18}: {v / sc:,.4g} {u}{bar}")
+        if self.corr is not None and len(self.corr) > 1:
+            pairs = []
+            names = list(self.corr.columns)
+            for i in range(len(names)):
+                for j in range(i + 1, len(names)):
+                    pairs.append((names[i], names[j],
+                                  float(self.corr.iloc[i, j])))
+            pairs.sort(key=lambda x: -abs(x[2]))
+            txt = ", ".join(f"{a}-{b} {c:+.2f}" for a, b, c in pairs[:4])
+            lines.append(f"  correlations      : {txt}")
+            if any(abs(c) > 0.95 for _, _, c in pairs):
+                lines.append(
+                    "                      a correlation beyond +/-0.95 means "
+                    "those two trade off almost freely:\n"
+                    "                      the surveys fix a combination of "
+                    "them, not each one.")
+        if np.isfinite(self.we_to_date_rb):
+            share = (100.0 * self.we_to_date_rb / self.withdrawal_to_date_rb
+                     if self.withdrawal_to_date_rb > 0 else float("nan"))
+            lines.append(
+                f"  We to date        : {self.we_to_date_rb / 1e6:,.2f} MMrb"
+                + (f" ({share:.0f} % of the reservoir withdrawal)"
+                   if np.isfinite(share) else ""))
+        if self.rock_note:
+            lines.append("  in rock terms     : " + self.rock_note)
+        if (np.isfinite(self.n_ceiling_stb)
+                and self.n_stb > 1.02 * self.n_ceiling_stb):
+            lines.append(
+                f"  WARNING           : the matched N is "
+                f"{self.n_stb / self.n_ceiling_stb:.2f}x the We >= 0 ceiling "
+                "min(F/Et) at this m. No aquifer\n                      can "
+                "make that true - influx only ADDS to the withdrawal - so the "
+                "match is\n                      fitting survey scatter. Do "
+                "not use this N.")
+        if self.dof < self.n_par:
+            lines.append(
+                f"  THIN              : {self.dof} degrees of freedom for "
+                f"{self.n_par} parameters. The match can bend to\n"
+                "                      the scatter; read the 95 % range, not "
+                "the point value.")
+        if self.floor_hit:
+            lines.append(
+                "  NOTE              : at some trial values the simulated "
+                "pressure hit the floor of the grid.")
+        for w in self.warnings_text:
+            lines.append("  NOTE              : " + w)
+        return "\n".join(lines)
+
+
+def aquifer_history_match(t_days: np.ndarray, np_stb: np.ndarray,
+                          gp_scf: np.ndarray, wp_stb: Optional[np.ndarray],
+                          t_survey: np.ndarray, p_survey: np.ndarray,
+                          pvt: OilPVT, kind: str = "fetkovich",
+                          m_gas_cap: float = 0.0, fit_m: bool = False,
+                          p_initial: Optional[float] = None,
+                          n_guess_stb: Optional[float] = None,
+                          aq_porosity: Optional[float] = None,
+                          aq_ro_ft: Optional[float] = None,
+                          aq_mu_w_cp: float = 0.5,
+                          min_dof: int = AQ_MIN_DOF,
+                          profile_points: int = 15) -> AquiferMatch:
+    """Regress N (and m) and an aquifer on the survey pressures.
+
+    Parameters are fitted in log space (m linearly), by least squares on the
+    pressure mismatch at the surveys, from several starting points. The
+    uncertainty is reported two ways: the linearised covariance, as one-sigma
+    factors and a correlation matrix, and a PROFILE of the mismatch against N
+    - N held at each value in turn, everything else refitted - read at the
+    95 % F-test level. On problems this badly conditioned the profile is the
+    one to believe; the covariance says which parameters are trading off.
+    """
+    kind = str(kind).lower()
+    if kind not in AQUIFER_KINDS:
+        raise ValueError(f"aquifer kind must be one of {AQUIFER_KINDS}")
+    pi = float(p_initial) if p_initial is not None else float(pvt.p_init)
+    out = AquiferMatch(kind=kind, fit_m=bool(fit_m), m=float(m_gas_cap or 0.0),
+                       p_initial=pi,
+                       p_initial_source=("as entered" if p_initial is not None
+                                         else "the PVT initial pressure"))
+    ts = np.asarray(t_survey, float)
+    ps = np.asarray(p_survey, float)
+    npv = np.asarray(np_stb, float)
+    tv = np.asarray(t_days, float)
+    ok_s = np.isfinite(ts) & np.isfinite(ps) & (ps > 0)
+    np_at_s = np.interp(ts, np.sort(tv),
+                        np.maximum.accumulate(np.nan_to_num(npv[np.argsort(tv)])))
+    obs = ok_s & (ts > 0) & (np_at_s > 0)
+    names = ["N"] + (["m"] if fit_m else []) + (
+        ["Wei", "tau"] if kind == "fetkovich" else
+        ["U", "t_c", "reD"] if kind == "radial" else [])
+    out.param_names = tuple(names)
+    out.n_obs, out.n_par = int(obs.sum()), len(names)
+    out.dof = out.n_obs - out.n_par
+    if out.dof < min_dof:
+        need = out.n_par + min_dof
+        alt = []
+        if fit_m:
+            alt.append("hold m from structure and logs")
+        if kind == "radial":
+            alt.append("use Fetkovich (two aquifer parameters, not three)")
+        alt.append("add surveys")
+        out.refused_reason = (
+            f"{out.n_par} parameters ({', '.join(names)}) need at least "
+            f"{need} surveys after first production - that many parameters "
+            f"plus {min_dof} to spare - and this record has {out.n_obs}. With "
+            "fewer, the match can pass through every survey whatever N is. "
+            "Options: " + "; ".join(alt) + ".")
+        return out
+    dp_max = float(np.max(pi - ps[obs]))
+    if dp_max < 50.0:
+        out.refused_reason = (
+            f"the deepest survey is only {dp_max:,.0f} psi below p_i; "
+            "there is no pressure history to match.")
+        return out
+
+    t_end = float(max(np.max(ts[obs]), 1.0))
+    h = _tank_history(tv, npv, gp_scf, wp_stb, pvt, pi, t_end)
+    t_o, p_o = ts[obs], ps[obs]
+    np_last = h.np_end
+
+    # -- parametrisation ------------------------------------------------
+    i_m = 1 if fit_m else None
+    j0 = 2 if fit_m else 1
+
+    def unpack(x):
+        n = math.exp(x[0])
+        m = float(x[i_m]) if fit_m else out.m
+        a = [math.exp(v) for v in x[j0:]]
+        if kind == "radial":
+            a[2] = 1.0 + a[2]          # reD - 1 is the log-fitted quantity
+        return n, m, a
+
+    def sim(x):
+        n, m, a = unpack(x)
+        if kind == "fetkovich":
+            return _simulate_tank(h, n, m, kind, a[0], a[1])
+        if kind == "radial":
+            return _simulate_tank(h, n, m, kind, a[0], a[1], a[2])
+        return _simulate_tank(h, n, m, "none")
+
+    floor_any = [False]
+
+    def resid(x):
+        p, _, fl = sim(x)
+        floor_any[0] |= fl
+        return np.interp(t_o, h.t, p) - p_o
+
+    n0 = float(n_guess_stb) if (n_guess_stb and np.isfinite(n_guess_stb)
+                                and n_guess_stb > np_last) else 20.0 * np_last
+    n_lo = max(np_last * 1.02, 1.0)
+    lb = [math.log(n_lo)]
+    ub = [math.log(max(n0, n_lo) * 1.0e3)]
+    if fit_m:
+        lb.append(0.0); ub.append(5.0)
+    boi = float(pvt.bo(np.array([pi]))[0])
+    T = t_end
+    starts_aq: List[List[float]] = [[]]
+    if kind == "fetkovich":
+        lb += [math.log(1.0e3), math.log(1.0)]
+        ub += [math.log(1.0e13), math.log(1.0e6)]
+        starts_aq = [[math.log(n0 * boi * c), math.log(T * r)]
+                     for c in (0.02, 0.2, 2.0) for r in (0.1, 1.0, 10.0)]
+    elif kind == "radial":
+        lb += [math.log(1.0e-3), math.log(1.0e-3), math.log(0.05)]
+        ub += [math.log(1.0e9), math.log(1.0e6), math.log(300.0)]
+        starts_aq = [[math.log(n0 * boi * c / pi), math.log(T * r),
+                      math.log(4.0)]
+                     for c in (1e-3, 1e-2, 1e-1) for r in (0.01, 0.1, 1.0)]
+    lb_a, ub_a = np.array(lb), np.array(ub)
+
+    # Starting points: every aquifer start is SCORED at three values of N,
+    # and only the best few are optimised. Optimising all of them cost
+    # 20-50 s a match on a radial aquifer, almost all of it spent polishing
+    # starts that were never going to win.
+    def x_start(nm, sa):
+        x0 = [math.log(min(max(n0 * nm, n_lo * 1.01), math.exp(ub[0]) / 2))]
+        if fit_m:
+            x0.append(min(max(out.m, 0.05), 4.9))
+        return np.clip(np.array(x0 + sa, float), lb_a + 1e-9, ub_a - 1e-9)
+
+    cands = []
+    for sa in starts_aq:
+        for nm in (1.0, 0.3, 3.0):
+            x0 = x_start(nm, sa)
+            rv = resid(x0)
+            cands.append((float(rv @ rv), x0))
+    cands.sort(key=lambda c: c[0])
+    best = None
+    for _, x0 in cands[:4]:
+        try:
+            r = optimize.least_squares(resid, x0, bounds=(lb_a, ub_a),
+                                       x_scale=1.0, diff_step=1e-3,
+                                       max_nfev=250)
+        except (ValueError, FloatingPointError):
+            continue
+        if best is None or r.cost < best.cost:
+            best = r
+    if best is None:
+        out.refused_reason = "the regression failed from every start."
+        return out
+
+    x = best.x
+    n_hat, m_hat, a_hat = unpack(x)
+    res = best.fun
+    ssr = float(res @ res)
+    s2 = ssr / max(out.dof, 1)
+    out.ran = True
+    out.n_stb, out.m = n_hat, m_hat
+    out.rms_psi = float(math.sqrt(ssr / len(res)))
+    k_mx = int(np.argmax(np.abs(res)))
+    out.max_resid_psi = float(-res[k_mx])      # observed minus simulated
+    out.max_resid_t = float(t_o[k_mx])
+    pnames = list(names)
+    vals = [n_hat] + ([m_hat] if fit_m else []) + list(a_hat)
+    out.params = dict(zip(pnames, vals))
+
+    # Linearised covariance, in the fitted (log) coordinates.
+    J = best.jac
+    try:
+        cov = s2 * np.linalg.pinv(J.T @ J)
+        sd = np.sqrt(np.clip(np.diag(cov), 0.0, None))
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cr = cov / np.outer(sd, sd)
+        out.corr = pd.DataFrame(np.clip(cr, -1, 1), index=pnames,
+                                columns=pnames)
+        for i, nm in enumerate(pnames):
+            if nm == "m":
+                out.param_sigma[nm] = float(sd[i])
+            else:
+                out.param_sigma[nm] = float(math.exp(min(sd[i], 50.0)))
+    except np.linalg.LinAlgError:
+        pass
+
+    # Profile on N: hold N, refit everything else, read the 95 % F level.
+    #
+    # A coarse scan first, then each edge of the 95 % region refined by
+    # bisection. Reading the edge off the coarse grid alone put it at the
+    # nearest grid point; on a synthetic tank with N = 50 MMstb that made the
+    # 95 % range 46.9 - 49.4 MMstb, which excludes the truth, because the
+    # grid step there was 23 %.
+    thresh = ssr * (1.0 + stats.f.ppf(0.95, 1, max(out.dof, 1))
+                    / max(out.dof, 1))
+    lo_b, hi_b = lb_a[0], ub_a[0]
+
+    def prof_at(ln_n: float, start: Optional[np.ndarray]):
+        if len(x) == 1:
+            rv = resid(np.array([ln_n]))
+            return float(rv @ rv), None
+
+        def rr(y):
+            return resid(np.concatenate([[ln_n], y]))
+        y0 = np.clip(start, lb_a[1:] + 1e-9, ub_a[1:] - 1e-9)
+        try:
+            r = optimize.least_squares(rr, y0, bounds=(lb_a[1:], ub_a[1:]),
+                                       diff_step=1e-3, max_nfev=100)
+        except (ValueError, FloatingPointError):
+            return float("nan"), start
+        return float(2.0 * r.cost), r.x
+
+    span = math.log(8.0)
+    grid = np.linspace(max(x[0] - span, lo_b), min(x[0] + span, hi_b),
+                       int(profile_points))
+    i0 = int(np.argmin(np.abs(grid - x[0])))
+    grid[i0] = x[0]
+    pts: Dict[float, Tuple[float, Optional[np.ndarray]]] = {
+        float(x[0]): (ssr, x[1:].copy() if len(x) > 1 else None)}
+    for rng_idx in (range(i0 + 1, len(grid)), range(i0 - 1, -1, -1)):
+        prev = x[1:].copy() if len(x) > 1 else None
+        for idx in rng_idx:
+            v, yx = prof_at(float(grid[idx]), prev)
+            if np.isfinite(v):
+                pts[float(grid[idx])] = (v, yx)
+                prev = yx if yx is not None else prev
+
+    # Extend the scan outwards while the 95 % region is still open on a side
+    # and the bound has not been reached. With a fixed +/- 8x scan, a strong
+    # aquifer whose best match sat at N = 1,340 MMstb reported "below the
+    # scan" at 168 MMstb when the truth, 50 MMstb, matched inside the 95 %
+    # level - the region did not end there, the scan did.
+    for _ in range(3):
+        keys_now = sorted(pts)
+        v_now = [pts[k][0] for k in keys_now]
+        grew = False
+        if v_now[0] <= thresh and keys_now[0] > lo_b + 1e-9:
+            prev = pts[keys_now[0]][1]
+            for ln_n in np.unique(np.clip(np.linspace(
+                    keys_now[0] - span / 3.0, keys_now[0] - span, 3),
+                    lo_b, None))[::-1]:
+                v, yx = prof_at(float(ln_n), prev)
+                if np.isfinite(v):
+                    pts[float(ln_n)] = (v, yx)
+                    prev = yx if yx is not None else prev
+                    if v > thresh:
+                        break
+            grew = True
+        if v_now[-1] <= thresh and keys_now[-1] < hi_b - 1e-9:
+            prev = pts[keys_now[-1]][1]
+            for ln_n in np.unique(np.clip(np.linspace(
+                    keys_now[-1] + span / 3.0, keys_now[-1] + span, 3),
+                    None, hi_b)):
+                v, yx = prof_at(float(ln_n), prev)
+                if np.isfinite(v):
+                    pts[float(ln_n)] = (v, yx)
+                    prev = yx if yx is not None else prev
+                    if v > thresh:
+                        break
+            grew = True
+        if not grew:
+            break
+
+    refined: Dict[float, float] = {}
+
+    def refine(inner: float, outer: float) -> float:
+        yi = pts[inner][1]
+        a, b = inner, outer
+        for _ in range(7):
+            mid = 0.5 * (a + b)
+            v, yx = prof_at(mid, yi)
+            if np.isfinite(v):
+                refined[float(mid)] = v       # kept for the profile plot
+            if np.isfinite(v) and v <= thresh:
+                a, yi = mid, (yx if yx is not None else yi)
+            else:
+                b = mid
+        return 0.5 * (a + b)
+
+    keys = np.array(sorted(pts))
+    vals_p = np.array([pts[k][0] for k in keys])
+    inside = vals_p <= thresh
+    j = int(np.argmin(np.abs(keys - x[0])))
+    jl = j
+    while jl - 1 >= 0 and inside[jl - 1]:
+        jl -= 1
+    jh = j
+    while jh + 1 < len(keys) and inside[jh + 1]:
+        jh += 1
+    open_lo = jl == 0
+    open_hi = jh == len(keys) - 1
+    ln_lo = keys[jl] if open_lo else refine(float(keys[jl]),
+                                            float(keys[jl - 1]))
+    ln_hi = keys[jh] if open_hi else refine(float(keys[jh]),
+                                            float(keys[jh + 1]))
+    out.n_range_stb = (math.exp(ln_lo), math.exp(ln_hi))
+    out.n_range_open = (bool(open_lo), bool(open_hi))
+    out.n_range_at_np = bool(open_lo and keys[jl] <= lb_a[0] + 1e-6)
+    allk = np.array(sorted(set(keys.tolist()) | set(refined)))
+    allv = np.array([pts[k][0] if k in pts else refined[k] for k in allk])
+    out.profile = pd.DataFrame({"N_stb": np.exp(allk), "ssr_psi2": allv,
+                                "threshold": thresh})
+
+    # The simulated history at the answer, and the closed tank for contrast.
+    p_sim, we_sim, fl = sim(x)
+    out.floor_hit = bool(fl)
+    out.t_sim, out.p_sim, out.we_sim = h.t, p_sim, we_sim
+    out.t_obs, out.p_obs = t_o, p_o
+    out.p_closed = _simulate_tank(h, n_hat, m_hat, "none")[0]
+    out.we_to_date_rb = float(we_sim[-1])
+    k_last = len(h.t) - 1
+    g_last = int(np.argmin(np.abs(h.pg - p_sim[-1])))
+    out.withdrawal_to_date_rb = float(h.F[k_last, g_last])
+
+    # The We >= 0 ceiling at the matched m, from the surveys themselves.
+    try:
+        gp_s = np.interp(t_o, np.sort(tv), np.maximum.accumulate(
+            np.nan_to_num(np.asarray(gp_scf, float)[np.argsort(tv)])))
+        wp_s = (np.interp(t_o, np.sort(tv), np.maximum.accumulate(
+            np.nan_to_num(np.asarray(wp_stb, float)[np.argsort(tv)])))
+            if wp_stb is not None else np.zeros_like(t_o))
+        tab = havlena_odeh_oil(p_o, np.interp(t_o, np.sort(tv),
+                               np.maximum.accumulate(np.nan_to_num(
+                                   npv[np.argsort(tv)]))),
+                               gp_s, wp_s, pvt, m_gas_cap=m_hat,
+                               p_initial=pi)
+        u = (tab["Et"].to_numpy(float) > 0) & (
+            tab["dp"].to_numpy(float) >= APPARENT_N_MIN_DP)
+        a = tab["apparent_N_stb"].to_numpy(float)[u]
+        a = a[np.isfinite(a) & (a > 0)]
+        if a.size:
+            out.n_ceiling_stb = float(np.min(a))
+    except (ValueError, KeyError):
+        pass
+
+    # Rock properties, translated - products only.
+    ct_aq = pvt.cw_per_psi + pvt.cf_per_psi
+    notes = []
+    if kind == "fetkovich":
+        wi = a_hat[0] / (ct_aq * pi)
+        notes.append(f"aquifer water volume Wi = Wei/(ct pi) = "
+                     f"{wi / 1e6:,.0f} MMrb at ct {ct_aq:.1e} 1/psi")
+    elif kind == "radial" and aq_porosity and aq_ro_ft:
+        phi, ro = float(aq_porosity), float(aq_ro_ft)
+        h_theta = a_hat[0] / (VEH_U_CONST * phi * ct_aq * ro ** 2)
+        k_md = phi * aq_mu_w_cp * ct_aq * ro ** 2 / (VEH_TD_CONST * a_hat[1])
+        notes.append(
+            f"h x (theta/360) = {h_theta:,.1f} ft (e.g. {h_theta:,.0f} ft at "
+            f"360 deg or {4 * h_theta:,.0f} ft at 90 deg - only the product "
+            f"is determined);{_IND}k = {k_md:,.0f} md; aquifer radius "
+            f"{a_hat[2] * ro:,.0f} ft; at phi {phi:.2f}, ro {ro:,.0f} ft, "
+            f"mu_w {aq_mu_w_cp:.2f} cp, ct {ct_aq:.1e} 1/psi")
+    elif kind == "radial":
+        notes.append("give aquifer porosity and reservoir radius to "
+                     "translate U and t_c into h x theta and k")
+    out.rock_note = "; ".join(notes)
+    return out
+
+
 def _mh_dmin_inactive(fit) -> bool:
     """A modified hyperbolic whose Dmin was fitted at or above Di."""
     p = getattr(fit, "params", {}) or {}
@@ -4364,6 +5115,9 @@ class OilWellResult:
     water_diag: Optional[WaterCutDiagnostic] = None
     pi_diag: Optional[OilPIDiagnostic] = None
     matbal: Optional[MaterialBalanceOil] = None
+    aquifer_match: Optional["AquiferMatch"] = None
+    aquifer_used: bool = False
+    aquifer_note: str = ""
     mc: Optional[pd.DataFrame] = None
     n_mc_requested: int = 0
     settings: Dict = field(default_factory=dict)
@@ -4460,6 +5214,12 @@ class OilWellResult:
             out.append("MATERIAL BALANCE (HAVLENA-ODEH)")
             out.append(self.matbal.summary())
             out.append("")
+        if self.aquifer_match is not None:
+            out.append(self.aquifer_match.summary())
+            if self.aquifer_note:
+                out.append(("  USED FOR FORECAST : " if self.aquifer_used
+                            else "  NOT USED          : ") + self.aquifer_note)
+            out.append("")
 
         out.append("DECLINE FIT")
         out.append(self.model_table.to_string(index=False))
@@ -4517,6 +5277,10 @@ def analyse_oil_well(df: "pd.DataFrame | OilProductionData",
                      mb_fit_gas_cap: bool = False,
                      mb_m_gas_cap: Optional[float] = None,
                      mb_skip_early: int = 0,
+                     mb_aquifer: str = "none",
+                     aq_porosity: Optional[float] = None,
+                     aq_ro_ft: Optional[float] = None,
+                     aq_mu_w_cp: float = 0.5,
                      apply_ooip_cap: bool = True,
                      water_cut_econ: Optional[float] = None,
                      q_water_econ_stbd: Optional[float] = None,
@@ -4625,6 +5389,85 @@ def analyse_oil_well(df: "pd.DataFrame | OilProductionData",
                         "withdrawal.")
                     n_cap = n_hard_max
 
+    # -- aquifer history match -------------------------------------------
+    # Run only when asked for. Its N replaces the Havlena-Odeh one for the
+    # forecast only when the surveys bound it from above and it respects the
+    # We >= 0 ceiling; otherwise it is reported and left alone, with the
+    # reason.
+    aq_match = None
+    aq_used = False
+    aq_note = ""
+    aq_sigma = 0.15
+    kind_aq = str(mb_aquifer or "none").lower()
+    if use_material_balance and kind_aq != "none":
+        sv = data.surveys
+        src = data.full_df if data.full_df is not None else data.df
+        n_guess = None
+        if matbal is not None:
+            for v in (matbal.n_ooip_stb, matbal.n_ceiling_stb):
+                if np.isfinite(v) and v > 0:
+                    n_guess = float(v)
+                    break
+        try:
+            aq_match = aquifer_history_match(
+                src["t"].to_numpy(float), src["Np_stb"].to_numpy(float),
+                src["Gp_scf"].to_numpy(float),
+                (src["Wp_stb"].to_numpy(float) if "Wp_stb" in src else None),
+                sv["t"].to_numpy(float) if len(sv) else np.array([]),
+                sv["p_res"].to_numpy(float) if len(sv) else np.array([]),
+                pvt, kind=kind_aq, m_gas_cap=float(mb_m_gas_cap or 0.0),
+                fit_m=bool(mb_fit_gas_cap), p_initial=mb_p_initial,
+                n_guess_stb=n_guess, aq_porosity=aq_porosity,
+                aq_ro_ft=aq_ro_ft, aq_mu_w_cp=aq_mu_w_cp)
+        except (ValueError, ArithmeticError, np.linalg.LinAlgError) as exc:
+            warnings.warn(f"[{well}] aquifer history match failed: {exc}")
+        if aq_match is not None and matbal is not None:
+            aq_match.n_ho_stb = float(matbal.n_ooip_stb)
+        if aq_match is not None and not aq_match.ran:
+            aq_note = "the match did not run - see above."
+        elif aq_match is not None and aq_match.accepted:
+            why = []
+            lo_r, hi_r = aq_match.n_range_stb
+            if aq_match.n_range_open[1]:
+                why.append("the surveys do not bound N from above")
+            elif lo_r > 0 and hi_r / lo_r > AQ_MAX_RANGE_RATIO:
+                why.append(f"the 95 % range on N spans a factor of "
+                           f"{hi_r / lo_r:,.1f}")
+            if (np.isfinite(aq_match.n_ceiling_stb)
+                    and aq_match.n_stb > 1.02 * aq_match.n_ceiling_stb):
+                why.append("the matched N breaks the We >= 0 ceiling")
+            if why:
+                aq_note = ("; ".join(why) + ", so the forecast keeps the "
+                           "Havlena-Odeh values.")
+            else:
+                aq_used = True
+                lo, hi = aq_match.n_range_stb
+                if lo > 0 and hi > lo:
+                    aq_sigma = float(min(max(
+                        (math.log(hi) - math.log(lo)) / (2.0 * 1.96), 0.02),
+                        1.0))
+                same_m = abs(aq_match.m - m_used) < 1e-9
+                m_used = float(aq_match.m)
+                we_to_date = float(aq_match.we_to_date_rb)
+                if not same_m:
+                    n_hard_max = None      # the ceiling was taken at another m
+                if apply_ooip_cap:
+                    n_cap = float(aq_match.n_stb)
+                    if n_hard_max is not None and n_cap > n_hard_max:
+                        n_cap = float(n_hard_max)
+                    n_press = None
+                else:
+                    n_cap = None
+                    n_press = float(aq_match.n_stb)
+                aq_note = (f"N {aq_match.n_stb / 1e6:,.2f} MMstb, m "
+                           f"{aq_match.m:.3f} and We to date "
+                           f"{aq_match.we_to_date_rb / 1e6:,.2f} MMrb\n"
+                           "                      replace the Havlena-Odeh "
+                           "values; the Monte Carlo spreads N over the 95 %\n"
+                           "                      range. The forecast "
+                           "pressure still freezes the aquifer at its influx "
+                           "to date.")
+
     # PI needs oil in place for its fallback p_avg, so it runs after the
     # balance; it prefers measured surveys and says which it used.
     try:
@@ -4702,7 +5545,8 @@ def analyse_oil_well(df: "pd.DataFrame | OilProductionData",
                 fits=(fits if sample_model_form else None),
                 gor_shapes=(gor_shapes if sample_model_form else None),
                 wor_shapes=(wor_shapes if sample_model_form else None),
-                n_ooip_hard_max=n_hard_max, **fkw)
+                n_ooip_hard_max=n_hard_max, n_ooip_rel_sigma=aq_sigma,
+                **fkw)
         except Exception as exc:
             warnings.warn(f"[{well}] Monte Carlo failed: {exc}")
 
@@ -4726,6 +5570,9 @@ def analyse_oil_well(df: "pd.DataFrame | OilProductionData",
                                  if p_abandon_psia else "none"),
         "forecast horizon": f"{t_max_years:,.0f} yr from the last record",
         "material balance": ("on" if use_material_balance else "off"),
+        "aquifer model": (kind_aq if kind_aq == "none" else
+                          kind_aq + (" - matched N used for the forecast"
+                                     if aq_used else " - match NOT used")),
         "gas cap m": (f"{m_used:.3f} "
                       + (("(fitted)" if (matbal is not None
                                          and matbal.m_fitted)
@@ -4762,6 +5609,7 @@ def analyse_oil_well(df: "pd.DataFrame | OilProductionData",
         best_fit=best, gor_model=gor_model, wor_model=wor_model,
         forecast=forecast, gor_diag=gor_diag, water_diag=water_diag,
         pi_diag=pi_diag, matbal=matbal, mc=mc,
+        aquifer_match=aq_match, aquifer_used=aq_used, aquifer_note=aq_note,
         n_mc_requested=(n_mc if run_monte_carlo else 0), settings=settings)
 
 
@@ -4814,6 +5662,61 @@ def _march_tank(n_stb: float, m: float, we_total_rb: float = 0.0,
         out_p.append(pp); out_np.append(Np); out_gp.append(Gp)
     return {"p": np.array(out_p), "Np": np.array(out_np),
             "Gp": np.array(out_gp), "pvt": pvt}
+
+
+def _march_fetkovich(pvt: OilPVT, n_stb: float, m: float, wei_rb: float,
+                     tau_days: float, q_stbd: float = 4000.0,
+                     months: int = 120, gor_mult: float = 2.0
+                     ) -> Dict[str, np.ndarray]:
+    """A tank with a Fetkovich aquifer, marched month by month.
+
+    Deliberately written the slow, obvious way - scalar PVT calls and a
+    bisection per month - and sharing no code with `_simulate_tank`, so that
+    agreement between the two is evidence rather than a tautology.
+    """
+    pi = pvt.p_init
+    boi, bgi, bti, swc = pvt.boi, pvt.bgi, pvt.bti, pvt.sw_initial
+    ce = (pvt.cw_per_psi * swc + pvt.cf_per_psi) / (1.0 - swc)
+    dt = 30.4375
+    Np = Gp = We = 0.0
+    p = pi
+    T, P, NP, GP, WE = [0.0], [pi], [0.0], [0.0], [0.0]
+    for k in range(1, months + 1):
+        rs = float(pvt.rs(np.array([p]))[0])
+        d = max(pvt.p_bubble - p, 0.0) / pvt.p_bubble
+        Np += q_stbd * dt
+        Gp += q_stbd * dt * rs * (1.0 + gor_mult * d)
+        pa = pi * (1.0 - We / wei_rb)
+        fac = 1.0 - math.exp(-dt / tau_days)
+
+        def we_of(pp, We=We, pa=pa, fac=fac, p=p):
+            return We + (wei_rb / pi) * fac * (pa - 0.5 * (p + pp))
+
+        def resid(pp, Np=Np, Gp=Gp, we_of=we_of):
+            a = np.array([pp])
+            bo, rsx = float(pvt.bo(a)[0]), float(pvt.rs(a)[0])
+            bg, bt = float(pvt.bg(a)[0]), float(pvt.bt(a)[0])
+            F = Np * (bo + (Gp / Np - rsx) * bg)
+            Et = ((bt - bti) + m * boi * (bg / bgi - 1.0)
+                  + (1.0 + m) * boi * ce * (pi - pp))
+            return F - n_stb * Et - we_of(pp)
+        lo, hi = 60.0, pi
+        if resid(hi) < 0:
+            pn = pi
+        else:
+            for _ in range(50):
+                mid = 0.5 * (lo + hi)
+                if resid(mid) > 0:
+                    hi = mid
+                else:
+                    lo = mid
+            pn = 0.5 * (lo + hi)
+        We = we_of(pn)
+        p = pn
+        T.append(k * dt); P.append(p); NP.append(Np); GP.append(Gp)
+        WE.append(We)
+    return {"t": np.array(T), "p": np.array(P), "Np": np.array(NP),
+            "Gp": np.array(GP), "Wp": np.zeros(len(T)), "We": np.array(WE)}
 
 
 def run_self_tests(verbose: bool = True) -> bool:
@@ -5206,6 +6109,90 @@ def run_self_tests(verbose: bool = True) -> bool:
           not pd_ok.qc.plateau_capped
           and "GUARD RAIL" not in pd_ok.qc.summary(),
           f"plateau end day {pd_ok.qc.plateau_end_days}")
+
+    # -- 2c. aquifer history match ----------------------------------------
+    td_chk = np.array([0.01, 0.1, 1.0, 10.0, 100.0])
+    rel = np.abs(veh_wd(td_chk) / _edwardson_wd(td_chk) - 1.0)
+    check("the radial WD matches Edwardson's published fit (infinite aquifer)",
+          float(rel.max()) < 1e-3, f"worst {100 * float(rel.max()):.3f} %")
+    check("a finite aquifer's WD tends to (reD^2 - 1)/2",
+          abs(float(veh_wd(np.array([1e5]), 5.0)[0]) - 12.0) < 1e-3)
+    check("a large aquifer behaves as an infinite one at early time",
+          abs(float(veh_wd(np.array([1.0]), 20.0)[0])
+              - float(veh_wd(np.array([1.0]))[0])) < 1e-6)
+
+    fk = _march_fetkovich(pvt, 50.0e6, 0.0, 40.0e6, 600.0)
+    # Same monthly steps as the marcher, so the comparison is of the solver
+    # and not of two discretisations of the Fetkovich recursion (which moves
+    # the answer by a few psi between monthly and 1.2-monthly steps).
+    hk = _tank_history(fk["t"], fk["Np"], fk["Gp"], fk["Wp"], pvt,
+                       pvt.p_init, float(fk["t"][-1]), n_steps=120)
+    p_k, we_k, _ = _simulate_tank(hk, 50.0e6, 0.0, "fetkovich", 40.0e6, 600.0)
+    dpk = float(np.max(np.abs(np.interp(fk["t"], hk.t, p_k) - fk["p"])))
+    check("the grid solver reproduces an independently marched aquifer tank",
+          dpk < 3.0, f"max |dp| {dpk:.2f} psi over "
+          f"{pvt.p_init - fk['p'][-1]:,.0f} psi of depletion")
+    rng_a = np.random.default_rng(1)
+    ia = np.arange(6, 121, 6)
+    ts_a = fk["t"][ia]
+    ps_a = fk["p"][ia] + rng_a.normal(0.0, 10.0, len(ia))
+    am = aquifer_history_match(fk["t"], fk["Np"], fk["Gp"], fk["Wp"], ts_a,
+                               ps_a, pvt, kind="fetkovich",
+                               n_guess_stb=80.0e6)
+    check("a Fetkovich match recovers N inside its own 95 % range",
+          am.ran and am.n_range_stb[0] <= 50.0e6 <= am.n_range_stb[1],
+          f"N {am.n_stb / 1e6:.1f} MMstb, range "
+          f"{am.n_range_stb[0] / 1e6:.1f}-{am.n_range_stb[1] / 1e6:.1f}")
+    check("a Fetkovich match recovers the aquifer volume",
+          abs(am.params.get("Wei", 0.0) / 40.0e6 - 1.0) < 0.10,
+          f"Wei {am.params.get('Wei', float('nan')) / 1e6:.1f} vs 40.0 MMrb")
+    check("Havlena-Odeh on the same record would not have: influx is not "
+          "absorbed into the matched N", abs(am.n_stb / 50.0e6 - 1.0) < 0.10)
+    am_r = aquifer_history_match(fk["t"], fk["Np"], fk["Gp"], fk["Wp"],
+                                 ts_a[:6], ps_a[:6], pvt, kind="radial",
+                                 fit_m=True)
+    check("a match with too few surveys for its parameters refuses to run",
+          not am_r.ran and "need at least 8 surveys" in am_r.summary(),
+          am_r.refused_reason[:60])
+    am_f6 = aquifer_history_match(fk["t"], fk["Np"], fk["Gp"], fk["Wp"],
+                                  ts_a[:6], ps_a[:6], pvt, kind="fetkovich")
+    check("N plus a Fetkovich aquifer runs on six surveys",
+          am_f6.ran and am_f6.dof == 3, f"dof {am_f6.dof}")
+    # A strong aquifer holding the pressure within ~500 psi: N and the
+    # aquifer trade off almost completely, and the match must say so rather
+    # than print its point value. Best-fit N on six noise draws of this tank
+    # ran from 17 to 1,344 MMstb against a truth of 50.
+    fs = _march_fetkovich(pvt, 50.0e6, 0.0, 150.0e6, 200.0)
+    rng_s = np.random.default_rng(102)
+    am_s = aquifer_history_match(fs["t"], fs["Np"], fs["Gp"], fs["Wp"],
+                                 fs["t"][ia], fs["p"][ia]
+                                 + rng_s.normal(0.0, 10.0, len(ia)), pvt,
+                                 kind="fetkovich", n_guess_stb=80.0e6)
+    lo_s, hi_s = am_s.n_range_stb
+    check("a strong aquifer's N is reported as not determined",
+          am_s.ran and "N NOT DETERMINED" in am_s.summary()
+          and lo_s <= 50.0e6 <= hi_s,
+          f"best {am_s.n_stb / 1e6:,.0f}, range {lo_s / 1e6:,.0f}-"
+          f"{hi_s / 1e6:,.0f} MMstb")
+    # The pot aquifer of the tool's own synthetic generator is a Fetkovich
+    # aquifer with a time constant near zero; a different generator again.
+    d_pot = make_synthetic_oil_well(pvt, n_ooip_stb=50.0e6, we_total_rb=12.0e6,
+                                    noise_frac=0.03, survey_every=6, seed=5)
+    r_pot = analyse_oil_well(d_pot, pvt, well="POT", q_econ_stbd=50.0,
+                             mb_aquifer="fetkovich", run_monte_carlo=False)
+    amp = r_pot.aquifer_match
+    check("the matched N is used, and says so, when the surveys bound it",
+          r_pot.aquifer_used and "matched N used" in r_pot.report()
+          and "AQUIFER HISTORY MATCH" in r_pot.report())
+    check("a pot aquifer is recovered by the Fetkovich match",
+          amp is not None and abs(amp.n_stb / 50.0e6 - 1.0) < 0.03
+          and amp.params.get("tau", 1e9) < 30.0,
+          f"N {amp.n_stb / 1e6:.2f} MMstb, tau "
+          f"{amp.params.get('tau', float('nan')):.1f} d" if amp else "")
+    check("the Havlena-Odeh N on that record is biased by the influx the "
+          "match accounts for", r_pot.matbal is not None
+          and r_pot.matbal.n_ooip_stb > 1.2 * 50.0e6,
+          f"HO {r_pot.matbal.n_ooip_stb / 1e6:.1f} MMstb")
 
     # -- 3. the balance inverted ------------------------------------------
     tk = _march_tank(50.0e6, 0.0)

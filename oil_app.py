@@ -165,7 +165,7 @@ def run_analysis(df: pd.DataFrame, pvt_sig: tuple, settings: tuple,
     """Analyse every well. Keyed on the frame, the PVT and the settings."""
     (q_econ, model, t_max, run_mc, n_mc, use_mb, fit_m, m_in, mb_pi, mb_skip,
      cap, wcut_lim, qw_lim, p_ab, rate_basis, min_uptime, outlier_sigma,
-     fit_from_bdf, window, sample_mf) = settings
+     fit_from_bdf, window, sample_mf, aq_kind, aq_phi, aq_ro, aq_mu) = settings
     pvt = build_pvt(*pvt_sig)
 
     raw = od.map_oil_columns(df)
@@ -186,6 +186,10 @@ def run_analysis(df: pd.DataFrame, pvt_sig: tuple, settings: tuple,
                 mb_m_gas_cap=(None if fit_m else m_in),
                 mb_p_initial=(mb_pi if mb_pi and mb_pi > 0 else None),
                 mb_skip_early=int(mb_skip), apply_ooip_cap=cap,
+                mb_aquifer=aq_kind,
+                aq_porosity=(aq_phi if aq_phi and aq_phi > 0 else None),
+                aq_ro_ft=(aq_ro if aq_ro and aq_ro > 0 else None),
+                aq_mu_w_cp=float(aq_mu or 0.5),
                 water_cut_econ=(wcut_lim / 100.0 if wcut_lim > 0 else None),
                 q_water_econ_stbd=(qw_lim if qw_lim > 0 else None),
                 p_abandon_psia=(p_ab if p_ab and p_ab > 0 else None),
@@ -344,6 +348,30 @@ with st.sidebar:
                                  "already producing when it was taken.")
     mb_skip = st.number_input("Drop this many earliest surveys", 0, 20, 0, 1)
     cap = st.checkbox("Cap the forecast at the fitted oil in place", True)
+    aq_kind = st.selectbox(
+        "Aquifer history match", ["none", "fetkovich", "radial"],
+        format_func=lambda k: {"none": "off",
+                               "fetkovich": "Fetkovich (2 aquifer parameters)",
+                               "radial": "Radial Van Everdingen-Hurst (3)"}[k],
+        key="aq_kind",
+        help="Simulates the tank through the production history with an "
+             "aquifer attached and regresses N (and m, if the gas-cap fit is "
+             "on) and the aquifer on the survey pressures, as MBAL does. The "
+             "radial aquifer is regressed on the three combinations the "
+             "pressures can see - U, the time constant and reD - not on "
+             "porosity, thickness and angle separately, which trade off "
+             "exactly. It refuses to run without at least three more "
+             "surveys than parameters.")
+    aq_phi = aq_ro = 0.0
+    aq_mu = 0.5
+    if aq_kind == "radial":
+        with st.expander("Aquifer rock, to translate the answer (optional)"):
+            aq_phi = st.number_input("Aquifer porosity", 0.0, 0.5, 0.0, 0.01,
+                                     key="aq_phi")
+            aq_ro = st.number_input("Reservoir radius ro, ft", 0.0, 1.0e5,
+                                    0.0, 100.0, key="aq_ro")
+            aq_mu = st.number_input("Water viscosity, cp", 0.1, 5.0, 0.5,
+                                    0.05, key="aq_mu")
 
     st.markdown("---")
     st.markdown("### Data handling")
@@ -378,7 +406,8 @@ with st.sidebar:
 
 settings = (q_econ, model, float(t_max), run_mc, int(n_mc), use_mb, fit_m,
             m_in, mb_pi, mb_skip, cap, wcut_lim, qw_lim, p_ab, rate_basis,
-            min_uptime, outlier_sigma, fit_from_bdf, window, bool(sample_mf))
+            min_uptime, outlier_sigma, fit_from_bdf, window, bool(sample_mf),
+            aq_kind, float(aq_phi), float(aq_ro), float(aq_mu))
 
 # ==============================================================================
 # Intake
@@ -534,6 +563,22 @@ with tabs[3]:
         if res.matbal.ho_table is not None:
             with st.expander("Survey-by-survey table"):
                 show_df(res.matbal.ho_table)
+    am = getattr(res, "aquifer_match", None)
+    if am is not None:
+        st.markdown("#### Aquifer history match")
+        if am.ran:
+            c1, c2 = st.columns(2)
+            with c1:
+                show_fig(oc.chart_aquifer_match(res, theme, height=PANEL_H),
+                         key="aqm")
+            with c2:
+                show_fig(oc.chart_aquifer_profile(res, theme, height=PANEL_H),
+                         key="aqp")
+        txt = am.summary()
+        if res.aquifer_note:
+            txt += ("\n" + ("  USED FOR FORECAST : " if res.aquifer_used
+                            else "  NOT USED          : ") + res.aquifer_note)
+        mono(txt)
 
 # -------------------------------------------------------------------- Forecast
 with tabs[4]:
@@ -655,6 +700,45 @@ When N and m are fitted together they are almost perfectly anti-correlated -
 measured at -1.00 - so the report quotes the LOCUS of pairs the data cannot
 separate rather than a standard error that describes only half of it.
 
+#### Aquifer history match
+
+Optional, and off by default. Where Havlena-Odeh treats influx as something to
+detect, this does what MBAL's regression does: it simulates the tank forward
+through the production history with an aquifer attached, predicts the pressure
+at every survey, and regresses N (and m, if the gas-cap fit is on) and the
+aquifer on the mismatch. Two aquifers: **Fetkovich** (pseudo-steady state,
+two parameters - the encroachable water Wei and a time constant) and **radial
+Van Everdingen-Hurst** (three - see below). The dimensionless influx WD is
+inverted from Laplace space and agrees with Edwardson's published fit to
+0.02 %.
+
+It differs from MBAL in three deliberate ways.
+
+- **It regresses on what the pressures can see.** A radial aquifer's porosity,
+  thickness, angle, reservoir radius and permeability only reach the pressure
+  through three combinations: `U = 1.119 phi ct h ro^2 (theta/360)`, the time
+  constant `phi mu ct ro^2 / (0.006328 k)`, and `reD`. A 170-degree aquifer
+  125 ft thick is identical to an 85-degree one 250 ft thick, so regressing on
+  both at once regresses on nothing. Rock properties are used afterwards, to
+  translate the answer - as products.
+- **It refuses to run without degrees of freedom to spare** - at least three
+  more surveys than parameters. With as many parameters as surveys the match
+  passes through every point whatever N is, and a standard deviation of
+  1e-8 psi is the sign of that, not of a good answer.
+- **It reports a range, not a point.** N is held at each value in turn, the
+  rest refitted, and the 95 % range read off at the F-test level. Where the
+  range spans more than a factor of three the report says N is not
+  determined, and the forecast keeps the Havlena-Odeh values.
+
+On marched synthetic tanks with 10 psi of survey noise: a moderate Fetkovich
+aquifer (1,600 psi of depletion) gave N within 6 % and a range of about
++/-9 %; with a gas cap and m fitted too, the range widened to a factor of 2.5;
+a radial aquifer with 1,100 psi of depletion gave a range spanning a factor
+of ten; and a strong aquifer holding the pressure within 500 psi gave
+best-fit N anywhere from 17 to 1,340 MMstb on a 50 MMstb tank - every one of
+them matching the surveys to within the noise. That last case is what a
+single regressed N hides.
+
 #### Diagnostics
 
 **GOR.** The bubble point read from surface data alone: the break where the
@@ -724,7 +808,7 @@ speak for itself.
 
 #### Verification
 
-161 self-tests, run with `python oil_dca.py`. They cover PVT shape and
+174 self-tests, run with `python oil_dca.py`. They cover PVT shape and
 continuity, N and m recovery on tanks marched from a known answer (exact at
 m = 0.00, 0.25, 0.60 and 1.20), the water-drive refusal, the balance inverted
 against the pressure that produced it, all four Chan mechanisms, the GOR break

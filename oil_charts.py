@@ -705,6 +705,103 @@ def chart_apparent_n(res, theme: str = "light", height: int = 380) -> go.Figure:
     return fig
 
 
+def chart_aquifer_match(res, theme: str = "light",
+                        height: int = 420) -> go.Figure:
+    """Survey pressures against the simulated tank, with and without aquifer."""
+    c = palette(theme)
+    am = getattr(res, "aquifer_match", None)
+    if am is None or not am.ran or am.t_sim is None:
+        return _empty(theme, "aquifer history match not run", height)
+    yrs = am.t_sim / 365.25
+    fig = go.Figure()
+    # The same N with the aquifer taken away: the gap between the two lines
+    # is the pressure support the match credits to the aquifer.
+    if am.p_closed is not None:
+        fig.add_trace(go.Scatter(
+            x=yrs, y=am.p_closed, mode="lines", name="same N, no aquifer",
+            line=dict(width=1.4, color=c["muted"], dash="dash"),
+            hovertemplate="%{x:.1f} yr<br>%{y:,.0f} psia<extra>closed tank"
+                          "</extra>"))
+    fig.add_trace(go.Scatter(
+        x=yrs, y=am.p_sim, mode="lines", name="matched tank + aquifer",
+        line=dict(width=2.2, color=c["series"][0]),
+        hovertemplate="%{x:.1f} yr<br>%{y:,.0f} psia<extra>matched</extra>"))
+    fig.add_trace(go.Scatter(
+        x=am.t_obs / 365.25, y=am.p_obs, mode="markers", name="surveys",
+        marker=_marker(c["series"][1], theme, size=9),
+        hovertemplate="%{x:.1f} yr<br>%{y:,.0f} psia<extra>survey</extra>"))
+    ys = [am.p_sim, am.p_obs] + ([am.p_closed] if am.p_closed is not None
+                                 else [])
+    _set_linear_range(fig, [yrs, am.t_obs / 365.25], ys)
+    fig = _layout(fig, theme, f"Pressure history match -- {res.well}",
+                  "Years on production", "Reservoir pressure (psia)",
+                  height=height)
+    fig.add_annotation(
+        text=f"RMS {am.rms_psi:,.1f} psi, {am.dof} dof", showarrow=False,
+        xref="paper", yref="paper", x=0.98, y=0.96, xanchor="right",
+        font=dict(size=11, color=c["muted"], family=FONT))
+    return fig
+
+
+def chart_aquifer_profile(res, theme: str = "light",
+                          height: int = 420) -> go.Figure:
+    """Best achievable mismatch at each N - the range the surveys allow."""
+    c = palette(theme)
+    am = getattr(res, "aquifer_match", None)
+    if am is None or not am.ran or am.profile is None or not len(am.profile):
+        return _empty(theme, "no N profile available", height)
+    pr = am.profile
+    x = pr["N_stb"].to_numpy(float) / 1e6
+    rms = np.sqrt(pr["ssr_psi2"].to_numpy(float) / max(am.n_obs, 1))
+    thr = float(np.sqrt(pr["threshold"].iloc[0] / max(am.n_obs, 1)))
+    fig = go.Figure()
+    lo, hi = am.n_range_stb
+    if np.isfinite(lo) and np.isfinite(hi):
+        fig.add_vrect(x0=lo / 1e6, x1=hi / 1e6, fillcolor=c["band"],
+                      line_width=0, layer="below",
+                      annotation_text="95 % range", annotation_position="top left",
+                      annotation_font=dict(size=10, color=c["muted"]))
+    fig.add_trace(go.Scatter(
+        x=x, y=rms, mode="lines+markers", name="best match at this N",
+        marker=_marker(c["series"][0], theme, size=7),
+        line=dict(width=1.8, color=c["series"][0]),
+        hovertemplate="N %{x:,.1f} MMstb<br>RMS %{y:,.1f} psi<extra></extra>"))
+    fig.add_hline(y=thr, line=dict(color=c["critical"], width=1.4, dash="dot"),
+                  annotation_text="95 % level", annotation_position="top left",
+                  annotation_font=dict(size=10, color=c["critical"]))
+    if am.n_ho_stb and np.isfinite(am.n_ho_stb):
+        fig.add_vline(x=am.n_ho_stb / 1e6,
+                      line=dict(color=c["muted"], width=1.2, dash="dash"),
+                      annotation_text="Havlena-Odeh N",
+                      annotation_position="bottom right",
+                      annotation_font=dict(size=10, color=c["muted"]))
+    fig = _layout(fig, theme, f"How well each N can be matched -- {res.well}",
+                  "Oil in place N (MMstb)", "Pressure mismatch, RMS (psi)",
+                  height=height)
+    # An explicit log range. Left to autorange, the vrect and vline put the
+    # axis out to 1e90 on the first screenshot and the curve collapsed onto
+    # a single vertical line.
+    # Zoom on the part of the profile that is on the chart vertically: the
+    # scan runs to 8x either side, and on a well-determined N the whole
+    # interesting region is a narrow V in the middle of it.
+    top_y = min(float(np.nanmax(rms)), thr * 6.0)
+    on = np.flatnonzero(np.isfinite(rms) & (rms <= top_y))
+    if on.size:
+        i_a, i_b = max(on[0] - 1, 0), min(on[-1] + 1, len(x) - 1)
+        x_view = list(x[i_a:i_b + 1])
+    else:
+        x_view = list(x)
+    xs = [v for v in x_view + [lo / 1e6, hi / 1e6]
+          if np.isfinite(v) and v > 0]
+    x_lo, x_hi = math.log10(min(xs)), math.log10(max(xs))
+    pad = 0.05 * max(x_hi - x_lo, 0.1)
+    fig.update_xaxes(type="log", range=[x_lo - pad, x_hi + pad])
+    top = float(np.nanmax(rms[np.isfinite(rms)])) if np.isfinite(rms).any() \
+        else thr * 2
+    fig.update_yaxes(range=[0.0, min(top, thr * 6.0) * 1.05])
+    return fig
+
+
 # ------------------------------------------------------------------------------
 # Uncertainty
 # ------------------------------------------------------------------------------
