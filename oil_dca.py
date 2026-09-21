@@ -54,6 +54,7 @@ Arps, J.J. (1945) *Analysis of decline curves.* Trans. AIME 160.
 from __future__ import annotations
 
 import math
+import re
 import textwrap
 import warnings
 from dataclasses import dataclass, field, replace
@@ -761,8 +762,18 @@ class MaterialBalanceOil:
                 if np.isfinite(self.n_stderr_stb) else ""))
             if np.isfinite(self.n_ooip_stb) else
             "  OOIP (N)          : NOT DETERMINED - see the drive note below",
-            (f"  R2                : {self.r2:.4f}" if np.isfinite(self.r2)
-             else "  R2                : -"),
+            (f"  R2                : {self.r2:.4f}"
+             if np.isfinite(self.r2) and self.r2 >= 0 else
+             # A line forced through the origin can fit worse than a flat
+             # line at the mean, and R2 then goes negative without limit. The
+             # field report printed "R2 : -821.7984" bare, next to an N quoted
+             # to +/- 23 %.
+             f"  R2                : {self.r2:.1f}  - BELOW ZERO: a flat line "
+             "fits F better than N x Et does.\n                      F and "
+             "Et are not proportional on these surveys, so the N above is "
+             "not a\n                      slope the data support - see the "
+             "drive note."
+             if np.isfinite(self.r2) else "  R2                : -"),
             (f"  gas cap m         : NOT DETERMINED - fit requested, but\n"
              f"                      {self.m_fit_why_not};\n"
              f"                      "
@@ -1300,6 +1311,10 @@ class OilQCReport:
     excluded_np_mstb: float = 0.0
     excluded_np_frac: float = 0.0
     plateau_end_days: Optional[float] = None
+    # The plateau end came from the 75 % guard rail, not from the data: the
+    # smoothed rate had not fallen to 92 % of its peak by then (or at all).
+    plateau_capped: bool = False
+    plateau_uncapped_days: Optional[float] = None
     bdf_start_days: Optional[float] = None
     fit_start_days: Optional[float] = None
     notes: List[str] = field(default_factory=list)
@@ -1334,7 +1349,22 @@ class OilQCReport:
         if self.plateau_end_days is not None:
             lines.append(f"  plateau ends            : day "
                          f"{self.plateau_end_days:.0f} "
-                         f"({self.plateau_end_days / DAYS_PER_YEAR:.2f} yr)")
+                         f"({self.plateau_end_days / DAYS_PER_YEAR:.2f} yr)"
+                         + ("   <-- GUARD RAIL, NOT FOUND"
+                            if self.plateau_capped else ""))
+            if self.plateau_capped:
+                lines.append(
+                    "                            the smoothed rate "
+                    + ("did not fall to 92 % of its peak until day "
+                       f"{self.plateau_uncapped_days:,.0f}"
+                       if self.plateau_uncapped_days is not None
+                       else "never fell to 92 % of its peak")
+                    + ",\n                            so the plateau end was "
+                    "set by the rule that at most 75 % of the\n"
+                    "                            record is discarded. The fit "
+                    "window is that rule, not a detected\n"
+                    "                            plateau - look at the rate "
+                    "plot and set the fit window yourself.")
         if self.bdf_start_days is not None:
             lines.append(f"  BDF start estimate      : day "
                          f"{self.bdf_start_days:.0f} "
@@ -1649,6 +1679,26 @@ class OilProductionData:
         if detect_bdf:
             p_idx, p_t = detect_decline_start(obj.t, obj.q_oil)
             qc.plateau_end_days = p_t
+            # Re-run the plateau test without its cap, to say whether the cap
+            # decided it. On a 54-year field record the fit window started at
+            # exactly 75 % of the retained points and the report presented it
+            # as a detected plateau end.
+            try:
+                nq = len(obj.t)
+                if p_idx is not None and nq >= 6:
+                    qs = gdca._smooth(np.asarray(obj.q_oil, float),
+                                      min(5, (nq // 3) | 1))
+                    ipk = int(np.argmax(qs))
+                    blw = np.flatnonzero(qs[ipk:] < 0.92 * qs[ipk])
+                    raw = int(ipk + blw[0]) if blw.size else None
+                    cap_i = max(0, min(int(0.75 * nq), nq - 4))
+                    if (raw is None or raw > cap_i) and p_idx == cap_i:
+                        qc.plateau_capped = True
+                        qc.plateau_uncapped_days = (float(obj.t[raw])
+                                                    if raw is not None
+                                                    else None)
+            except (ValueError, IndexError, AttributeError):
+                pass
             mask = obj.t >= (p_t if p_t is not None else obj.t[0])
             b_idx, b_t = (detect_bdf_start(obj.t[mask], obj.q_oil[mask])
                           if mask.sum() >= 12 else (None, None))
@@ -1663,6 +1713,42 @@ class OilProductionData:
                         "from the decline fit: plateau and pre-boundary-"
                         "dominated flow.")
         return obj
+
+
+def _mh_dmin_inactive(fit) -> bool:
+    """A modified hyperbolic whose Dmin was fitted at or above Di."""
+    p = getattr(fit, "params", {}) or {}
+    return bool("Dmin" in p and "Di" in p
+                and np.isfinite(p["Dmin"]) and np.isfinite(p["Di"])
+                and p["Dmin"] >= p["Di"])
+
+
+def _fit_summary_text(fit) -> str:
+    """The shared fit summary, corrected where it misdescribes the curve.
+
+    The modified hyperbolic clamps Dmin to just below Di when the optimiser
+    returns it above, which switches the curve to exponential at t0 and makes
+    b and Dmin inert. The shared summary printed the optimiser's Dmin anyway:
+    a field report read "Di (eff) 0.5 %/yr, Dmin(eff) 8.0 %/yr" on a curve
+    that declines at 0.47 %/yr for its whole length, with b and Dmin carrying
+    error bars of 1.9e-09 and 0 - which is what a parameter with no effect on
+    the fit looks like, not a precise estimate.
+    """
+    txt = fit.summary()
+    if not _mh_dmin_inactive(fit):
+        return txt
+    di = float(fit.params["Di"])
+    d_eff = 100.0 * (1.0 - math.exp(-di * DAYS_PER_YEAR))
+    txt = re.sub(r"Dmin\(eff\) : [^\n]*",
+                 "Dmin(eff) : as fitted, above Di - NOT USED by the curve",
+                 txt)
+    txt += (f"\n  NOTE      : Dmin was fitted above Di, so the curve switches "
+            f"to exponential at t0 and\n              declines at "
+            f"{d_eff:.2f} %/yr for its whole length. b and Dmin have no "
+            "effect on the\n              rate, and their tiny error bars "
+            "say only that. Read this fit as an\n              exponential "
+            "at Di.")
+    return txt
 
 
 # ==============================================================================
@@ -1703,6 +1789,20 @@ class GORDiagnostic:
     # later GOR break cannot be the bubble-point crossing. It is the free gas
     # reaching critical saturation and starting to flow.
     saturated: bool = False
+    # The sustained peak sits in the first few periods of the record: the
+    # GOR falls from first production rather than rising then falling.
+    peak_at_start: bool = False
+
+    @property
+    def implausible_for_black_oil(self) -> bool:
+        # A sustained GOR of 73,445 scf/STB on a fluid with Rsi 391 was
+        # analysed as a black oil without comment. Solution-gas drive takes
+        # the producing GOR to a few times Rsi, sometimes ten; twenty times
+        # Rsi and over 10,000 scf/STB is gas-condensate or wet-gas territory,
+        # or gas entered in the wrong units.
+        return bool(self.ok and np.isfinite(self.gor_max) and self.rsi > 0
+                    and self.gor_max > 20.0 * self.rsi
+                    and self.gor_max > 10000.0)
 
     @property
     def broke(self) -> bool:
@@ -1744,6 +1844,8 @@ class GORDiagnostic:
                 f"({100 * self.break_frac_of_record:.0f} % of the record): "
                 "that is the\n                      reservoir crossing its "
                 "bubble point, read from surface data alone.")
+        elif self.peak_at_start:
+            pass                    # said below, with the peak
         elif self.peaked and self.saturated:
             lines.append(
                 "                      the GOR has already peaked and is "
@@ -1778,7 +1880,17 @@ class GORDiagnostic:
                 "Rsi - free gas is being produced, so the\n                    "
                 "  reservoir is below the bubble point and losing its own "
                 "drive energy.")
-        if self.peaked and self.peak_np_stb is not None:
+        if self.peak_at_start and self.peak_np_stb is not None:
+            lines.append(
+                f"                      the GOR is highest at the START of "
+                f"the record (Np = {self.peak_np_stb / STB_PER_MSTB:,.0f} "
+                "Mstb) and falls\n                      from there. That is "
+                "not the rise and fall of solution-gas drive: any rising\n"
+                "                      limb is before this history, and the "
+                "first months of a well are often\n                      "
+                "clean-up or test readings. No conclusion about drive energy "
+                "is drawn from it.")
+        elif self.peaked and self.peak_np_stb is not None:
             lines.append(
                 f"                      GOR peaked at Np = "
                 f"{self.peak_np_stb / STB_PER_MSTB:,.0f} Mstb and has since "
@@ -1800,6 +1912,17 @@ class GORDiagnostic:
                 "peak are both unreliable, in both directions - treat every "
                 "shape\n                      reading above as indicative "
                 "and confirm it against a pressure survey.")
+        if self.implausible_for_black_oil:
+            lines.append(
+                f"  WARNING           : the sustained GOR reaches "
+                f"{self.gor_max:,.0f} scf/STB, {self.gor_max / self.rsi:,.0f}x "
+                "Rsi. Solution-gas\n                      drive does not do "
+                "that; above a few thousand scf/STB the fluid behaves as a\n"
+                "                      gas condensate or wet gas. Check that "
+                "q_gas is in Mscf/d (scf/d reads 1,000x\n                      "
+                "high), and whether gas-cap or gas-zone gas is being produced. "
+                "The black-oil\n                      PVT and material "
+                "balance here assume neither.")
         if np.isfinite(self.below_rsi_fraction) and self.below_rsi_fraction > 0.5:
             lines.append(
                 f"  WARNING           : {100 * self.below_rsi_fraction:.0f} % "
@@ -1963,6 +2086,7 @@ def gor_diagnostic(gor: np.ndarray, np_stb: np.ndarray, rsi: float,
         break_np_stb=(float(n[best_i]) if broke else None),
         break_frac_of_record=(float(best_i) / len(g) if broke else float("nan")),
         peaked=bool(peaked),
+        peak_at_start=bool(peaked and pk < n_early),
         peak_np_stb=(float(n[pk]) if peaked else None),
         scatter_frac=(sigma / plateau if plateau > 0 else float("nan")),
         n_points=len(g), below_rsi_fraction=below)
@@ -1997,6 +2121,9 @@ class WaterCutDiagnostic:
     n_fitted: int = 0
     r2: float = float("nan")
     reason: str = ""
+    # Water in the very first period: breakthrough is before this history,
+    # so 'time since breakthrough' - Chan's abscissa - is an assumption.
+    water_from_start: bool = False
 
     def summary(self) -> str:
         if not self.ok:
@@ -2009,6 +2136,12 @@ class WaterCutDiagnostic:
                 f"                      breakthrough at day "
                 f"{self.breakthrough_t_days:,.0f} "
                 f"({self.breakthrough_t_days / DAYS_PER_YEAR:.1f} yr)")
+        elif self.water_from_start:
+            lines.append(
+                "                      water from the first record: "
+                "breakthrough is before this history, so\n"
+                "                      Chan's time-since-breakthrough axis "
+                "is assumed, and the slopes below with it.")
         if np.isfinite(self.wor_slope):
             lines.append(
                 f"                      Chan WOR slope {self.wor_slope:+.2f} "
@@ -2018,7 +2151,11 @@ class WaterCutDiagnostic:
             # a slope near zero, so it is arbitrarily large and means nothing.
             # A flat WOR is already the whole finding; printing a -7.9 next to
             # it would only invite someone to read a magnitude into noise.
-            if abs(self.wor_slope) >= 0.3 and np.isfinite(
+            # On a FALLING WOR the departure 2*c2/a flips sign with a, and the
+            # field report printed "+1.71 (-2.9 sigma)" - a curvature and its
+            # significance with opposite signs. It only means something on
+            # the rising WOR Chan's patterns are defined for.
+            if self.wor_slope >= 0.3 and np.isfinite(
                     self.wor_prime_departure):
                 lines.append(
                     f"                      WOR' slope "
@@ -2067,6 +2204,7 @@ def chan_diagnostic(t_days: np.ndarray, q_oil: np.ndarray,
             n_points=int(len(wor)))
     bt_i = int(np.argmax(prod))
     tb = float(t[bt_i]) if bt_i > 0 else None
+    from_start = bool(bt_i == 0)
 
     # Chan reads the trend AFTER breakthrough has settled, and the window has
     # to start clear of breakthrough itself. Anchoring it on the first wet
@@ -2175,7 +2313,21 @@ def chan_diagnostic(t_days: np.ndarray, q_oil: np.ndarray,
     # simply could not see. That is INDETERMINATE, and saying "normal
     # displacement" there is a claim the data do not support.
     strong = np.isfinite(curv_z) and abs(curv_z) >= 2.0
-    if s1 < 0.3:
+    # A WOR that FALLS after breakthrough is none of Chan's patterns. The
+    # field report classified a slope of -0.81 over 321 periods as "CONING
+    # or a stabilised cone - WOR has gone flat", which it had not: it had
+    # fallen, and a falling WOR points at the well or the data, not at the
+    # reservoir's water mechanism.
+    if s1 <= -0.3 and np.isfinite(lr.pvalue) and lr.pvalue < 0.05:
+        mech = ("WOR FALLING after breakthrough - not one of Chan's patterns, "
+                "and not coning.\n                      A falling WOR usually "
+                "means an intervention (water shut-off, recompletion,\n"
+                "                      a zone closed in), a change in how "
+                "water is allocated or metered, or a\n                      "
+                "water source that is itself depleting. Check the well "
+                "history before reading\n                      a mechanism "
+                "into it.")
+    elif s1 < 0.3:
         mech = ("CONING or a stabilised cone - WOR has gone flat after "
                 "breakthrough, which is\n                      the signature "
                 "of a cone that reaches equilibrium. This one does "
@@ -2221,6 +2373,7 @@ def chan_diagnostic(t_days: np.ndarray, q_oil: np.ndarray,
                 "needs more post-breakthrough history.")
 
     return WaterCutDiagnostic(
+        water_from_start=from_start,
         ok=True, mechanism=mech, wor_slope=s1, wor_prime_slope=s2,
         wor_prime_departure=delta, curvature_z=curv_z,
         falling_fraction=falling_frac,
@@ -2580,7 +2733,10 @@ class RatioModel:
         return (f"  {self.label} model        : {self.kind}, "
                 f"{self.pct_per_mmstb:+,.0f} % per MMstb of oil "
                 f"(R2 {self.r2:.2f}, p {self.p_value:.1e}, n={self.n_points})"
-                + (f"\n                      {self.note}" if self.note else ""))
+                + ("\n" + textwrap.fill(self.note, width=100,
+                                        initial_indent=" " * 22,
+                                        subsequent_indent=" " * 22)
+                   if self.note else ""))
 
 
 def _fit_ratio_model(np_stb: np.ndarray, ratio: np.ndarray, label: str,
@@ -3035,7 +3191,7 @@ class OilForecast:
             lines.append(
                 "                      ALREADY PAST: "
                 + ", ".join(self.constraints_breached_at_start)
-                + " - the well is over this limit on the first forecast "
+                + " - the well is past this limit on the first forecast "
                   "step, so the\n                      life above is the last "
                   "historical date, not a forecast of anything.")
         for w in self.warnings_text:
@@ -3280,6 +3436,24 @@ def forecast_oil(fit: FitResult,
         constraint_years["oil rate"] = (float(t_rate_true / DAYS_PER_YEAR)
                                         if np.isfinite(t_rate_true)
                                         else float("inf"))
+        # The fitted curve can already be below the economic rate where the
+        # forecast starts. The rate limit was then clamped to one step past
+        # the start, so the well was given a month of production beyond its
+        # own limit - 1 Mstb on a field record whose curve read 31 STB/d
+        # against a 50 STB/d limit - and the report said "ends on oil rate"
+        # with the rate constraint dated 24 years in the past. Every other
+        # limit already stops dead when it is breached at the start; the rate
+        # limit now does too.
+        q_start = float(model.rate(np.array([t_start_days]))[0])
+        if np.isfinite(q_start) and q_start < q_econ_stbd:
+            breached.append("oil rate")
+            cut_at, reason = 0, "oil rate"
+            notes.append(
+                f"The fitted curve reads {q_start:,.1f} STB/d at the last "
+                f"record, below the {q_econ_stbd:,.0f} STB/d economic "
+                "rate.\n                      Either the well is already "
+                "sub-economic at that limit, or the fit window\n"
+                "                      does not describe the current rate.")
 
     def _apply(label: str, key: str, limit: Optional[float],
                above: bool = True,
@@ -3808,6 +3982,12 @@ def monte_carlo_oil_eur(fit: FitResult,
     return out
 
 
+def _ordinal(k: int) -> str:
+    if 10 <= k % 100 <= 20:
+        return f"{k}th"
+    return f"{k}{ {1: 'st', 2: 'nd', 3: 'rd'}.get(k % 10, 'th') }"
+
+
 def summarise_oil_mc(mc: pd.DataFrame, deterministic: OilForecast,
                      n_requested: int = 0) -> str:
     """Percentiles, in the petroleum convention, with the caveats that matter."""
@@ -3826,10 +4006,26 @@ def summarise_oil_mc(mc: pd.DataFrame, deterministic: OilForecast,
     # labelled. A reader comparing a single number against P90/P50/P10 has no
     # way to see that unless it is said.
     pctl = 100.0 * float(np.mean(e <= det))
+    # A band too narrow to hold anything. When the forecast adds next to
+    # nothing to the history, every realisation lands within a rounding
+    # error of every other, and 'where the base case sits' is decided by
+    # the last decimal. The field report said the base case was at the
+    # "92th percentile" and "outside its own P90-P10" of a band printed as
+    # 429 / 429 / 429 - and then blamed the choice of curve.
+    degenerate = bool((p10 - p90) <= max(0.005 * abs(p50), 1.0))
+    if degenerate:
+        lines.append(
+            f"                      Every realisation gives the same EUR to "
+            f"within {p10 - p90:,.1f} Mstb: the forecast adds\n"
+            "                      almost nothing to the history, so there is "
+            "no spread to read. Where the\n                      base case "
+            "sits in it, and which curves were sampled, do not matter here.")
+        return "\n".join(lines)
     if len(e) >= 20 and not (25.0 <= pctl <= 75.0):
         lines.append(
             f"                      The base case sits at the "
-            f"{pctl:.0f}th percentile of its own distribution, not the "
+            f"{_ordinal(int(round(pctl)))} percentile of its own "
+            "distribution, not the "
             f"middle.\n                      It uses one decline curve; the "
             "realisations use several, weighted by fit. Read\n"
             "                      P50 as the central case and the "
@@ -4269,7 +4465,8 @@ class OilWellResult:
         out.append(self.model_table.to_string(index=False))
         out.append("")
         out.append(f"  selected          : {self.best_fit.model_name}")
-        out.append("  " + self.best_fit.summary().replace("\n", "\n  ").strip())
+        out.append("  " + _fit_summary_text(self.best_fit)
+                   .replace("\n", "\n  ").strip())
         wk = list(getattr(self.best_fit, "weak_params", []) or [])
         if wk:
             out.append(
@@ -4940,6 +5137,76 @@ def run_self_tests(verbose: bool = True) -> bool:
     check("a held-constant ratio note is wrapped, not one long line",
           max(len(ln) for ln in rm_c.summary().splitlines()) <= 110)
 
+    # -- 2b. the fourth field report ---------------------------------------
+    from types import SimpleNamespace
+    mb_neg = MaterialBalanceOil(n_ooip_stb=4.8e8, n_stderr_stb=1.1e8,
+                                r2=-821.8, n_surveys=6, p_initial=3493.0)
+    check("a negative material-balance R2 is explained, not printed bare",
+          "BELOW ZERO" in mb_neg.summary())
+    check("ordinals are English", [_ordinal(k) for k in (1, 2, 3, 11, 92)]
+          == ["1st", "2nd", "3rd", "11th", "92nd"])
+    rng_t = np.random.default_rng(3)
+    mc_flat = pd.DataFrame({
+        "eur_oil_mstb": 429.0 + rng_t.normal(0.0, 0.05, 400),
+        "model": rng_t.choice(["arps", "sepd"], 400, p=[0.1, 0.9])})
+    sm_flat = summarise_oil_mc(mc_flat, SimpleNamespace(
+        eur_oil_mstb=429.3, model_name="modified_hyperbolic"))
+    check("a band with nothing in it makes no claims about percentiles",
+          "no spread to read" in sm_flat and "percentile" not in sm_flat
+          and "OUTSIDE" not in sm_flat.upper().replace("OUTSIDE THE", ""))
+    fake_fit = SimpleNamespace(
+        params={"qi": 31.0, "Di": 1.29e-5, "b": 1.99, "Dmin": 2.28e-4},
+        summary=lambda: "  Di (eff)  : 0.5 %/yr at t0\n  Dmin(eff) : 8.0 %/yr")
+    txt_mh = _fit_summary_text(fake_fit)
+    check("a Dmin fitted above Di is not reported as the terminal decline",
+          "8.0 %/yr" not in txt_mh and "NOT USED" in txt_mh
+          and "exponential" in txt_mh)
+    # GOR highest at first production and far beyond any black oil.
+    npg = np.linspace(1.0e3, 4.3e5, 300)
+    g_hi = 60000.0 * np.exp(-npg / 1.5e5) + 4000.0
+    g_hi = g_hi * (1.0 + 0.05 * rng_t.standard_normal(300))
+    gd_hi = gor_diagnostic(g_hi, npg, 391.0, saturated=True)
+    sm_hi = gd_hi.summary()
+    check("a GOR peak at the start of the record is not read as spent "
+          "solution-gas drive", gd_hi.peak_at_start
+          and "solution-gas drive is spent" not in sm_hi
+          and "START of the record" in sm_hi)
+    check("a GOR no black oil can make is flagged, units included",
+          gd_hi.implausible_for_black_oil and "Mscf/d" in sm_hi)
+    # WOR falling from the first record.
+    tw = 30.4375 * np.arange(1, 301)
+    qo_w = np.full(300, 100.0)
+    wor_w = 10.0 * (tw / tw[0]) ** -0.3 * np.exp(
+        0.1 * rng_t.standard_normal(300))
+    wd_f = chan_diagnostic(tw, qo_w, qo_w * wor_w)
+    sm_wf = wd_f.summary()
+    check("a falling WOR is not called coning",
+          wd_f.mechanism.startswith("WOR FALLING")
+          and "CONING" not in sm_wf, wd_f.mechanism.split("\n")[0])
+    check("no departure/sigma pair is printed for a falling WOR",
+          "departure from a straight" not in sm_wf)
+    check("water from the first record is said",
+          wd_f.water_from_start and "water from the first record" in sm_wf)
+    # A plateau end set by the 75 % guard rail.
+    dts = pd.date_range("1970-01-01", periods=400, freq="MS")
+    qpl = np.where(np.arange(400) < 360, 100.0,
+                   100.0 - 30.0 * (np.arange(400) - 360) / 39.0)
+    pd_cap = OilProductionData.prepare(
+        pd.DataFrame({"date": dts, "q_oil": qpl, "q_gas": qpl * 0.4}),
+        pvt, well="CAP")
+    check("a plateau end set by the guard rail says so",
+          pd_cap.qc.plateau_capped
+          and "GUARD RAIL" in pd_cap.qc.summary())
+    qpl2 = np.where(np.arange(400) < 100, 100.0,
+                    100.0 * np.exp(-0.01 * (np.arange(400) - 100)))
+    pd_ok = OilProductionData.prepare(
+        pd.DataFrame({"date": dts, "q_oil": qpl2, "q_gas": qpl2 * 0.4}),
+        pvt, well="OK")
+    check("a real plateau end is not called a guard rail",
+          not pd_ok.qc.plateau_capped
+          and "GUARD RAIL" not in pd_ok.qc.summary(),
+          f"plateau end day {pd_ok.qc.plateau_end_days}")
+
     # -- 3. the balance inverted ------------------------------------------
     tk = _march_tank(50.0e6, 0.0)
     j = len(tk["p"]) // 2
@@ -5113,6 +5380,14 @@ def run_self_tests(verbose: bool = True) -> bool:
           no_limit.abandonment_reason == "max forecast life")
     check("an EUR set by the horizon rather than the reservoir says so",
           "THE HORIZON SET THIS EUR" in no_limit.summary())
+
+    q_now = float(bf.model.rate(np.array([float(tt[-1])]))[0])
+    sub = forecast_oil(bf, gm, wm, pvt, q_now * 1.6, **base)
+    check("a curve already below the economic rate gives no forecast",
+          "oil rate" in sub.constraints_breached_at_start
+          and abs(sub.remaining_oil_mstb) < 1e-6
+          and "ALREADY PAST" in sub.summary(),
+          f"{sub.remaining_oil_mstb:,.3f} Mstb remaining")
 
     # An abandonment pressure with no N to turn production into pressure
     # cannot be applied. The field report dropped it without a word and

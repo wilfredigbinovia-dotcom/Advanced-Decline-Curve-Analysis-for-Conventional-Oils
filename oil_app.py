@@ -494,7 +494,7 @@ with tabs[1]:
          "model whose late-time behaviour you can defend. A parameter shown "
          "under 'at_bounds' is not a fitted value.")
     show_df(res.model_table)
-    mono(res.best_fit.summary())
+    mono(od._fit_summary_text(res.best_fit))
     wk = list(getattr(res.best_fit, "weak_params", []) or [])
     if wk:
         st.warning(f"At a bound: {', '.join(wk)}. The forecast inherits "
@@ -724,7 +724,7 @@ speak for itself.
 
 #### Verification
 
-149 self-tests, run with `python oil_dca.py`. They cover PVT shape and
+161 self-tests, run with `python oil_dca.py`. They cover PVT shape and
 continuity, N and m recovery on tanks marched from a known answer (exact at
 m = 0.00, 0.25, 0.60 and 1.20), the water-drive refusal, the balance inverted
 against the pressure that produced it, all four Chan mechanisms, the GOR break
