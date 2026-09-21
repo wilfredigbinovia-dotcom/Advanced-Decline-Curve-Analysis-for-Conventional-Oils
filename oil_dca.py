@@ -54,6 +54,7 @@ Arps, J.J. (1945) *Analysis of decline curves.* Trans. AIME 160.
 from __future__ import annotations
 
 import math
+import textwrap
 import warnings
 from dataclasses import dataclass, field, replace
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -683,6 +684,14 @@ class MaterialBalanceOil:
     m_gas_cap: float = 0.0
     m_fitted: bool = False
     m_stderr: float = float("nan")
+    # The gas-cap fit was asked for but the surveys could not carry it: fewer
+    # than three usable points at every m, or a minimum so flat it spans
+    # most of the scan. The m reported is then the one supplied (or 0), and
+    # it is labelled as such rather than as FITTED.
+    m_fit_requested: bool = False
+    m_fit_why_not: str = ""
+    n_uninformative_ceiling: bool = False
+    depletion_note: str = ""
     r2: float = float("nan")
     n_surveys: int = 0
     n_skipped: int = 0
@@ -754,11 +763,16 @@ class MaterialBalanceOil:
             "  OOIP (N)          : NOT DETERMINED - see the drive note below",
             (f"  R2                : {self.r2:.4f}" if np.isfinite(self.r2)
              else "  R2                : -"),
-            f"  gas cap m         : {self.m_gas_cap:.4f}"
-            + (f" +/- {self.m_stderr:.4f}  (FITTED)" if self.m_fitted
-               else "  (as entered)")
-            + ("   - no gas cap assumed" if self.m_gas_cap == 0.0
-               and not self.m_fitted else ""),
+            (f"  gas cap m         : NOT DETERMINED - fit requested, but\n"
+             f"                      {self.m_fit_why_not};\n"
+             f"                      "
+             f"m = {self.m_gas_cap:.4f} used in its place"
+             if self.m_fit_requested and not self.m_fitted else
+             f"  gas cap m         : {self.m_gas_cap:.4f}"
+             + (f" +/- {self.m_stderr:.4f}  (FITTED)" if self.m_fitted
+                else "  (as entered)")
+             + ("   - no gas cap assumed" if self.m_gas_cap == 0.0
+                and not self.m_fitted else "")),
         ]
         if self.gas_cap_indicated:
             lines += [
@@ -786,6 +800,18 @@ class MaterialBalanceOil:
             + (f"\n                      from {n_ceil_pts} survey(s) only - "
                "a bound, but a loose one" if 0 < n_ceil_pts < 3 else ""),
         ]
+        if self.depletion_note:
+            lines.append(f"  depletion seen    : {self.depletion_note}")
+        if self.n_uninformative_ceiling:
+            lines.append(
+                "  NOTE              : the ceiling is over 50x the oil "
+                "produced, so it constrains nothing.\n"
+                "                      Little pressure drop for this much "
+                "production means strong support (aquifer\n"
+                "                      or gas cap) or a connected volume far "
+                "larger than the well drains; the\n"
+                "                      surveys cannot tell which. The ceiling "
+                "is not an estimate of oil in place.")
         if np.isfinite(self.apparent_n_spread):
             lines.append(
                 f"  apparent N spread : {100 * self.apparent_n_spread:.1f} % "
@@ -820,8 +846,8 @@ class MaterialBalanceOil:
                 loc = (f"\n                      The data cannot separate "
                        f"m {self.m_locus[0]:.2f}-{self.m_locus[1]:.2f} from "
                        f"N {self.n_locus_stb[0] / STB_PER_MSTB:,.0f}-"
-                       f"{self.n_locus_stb[1] / STB_PER_MSTB:,.0f} Mstb: that "
-                       "pair IS the answer.")
+                       f"{self.n_locus_stb[1] / STB_PER_MSTB:,.0f} Mstb:\n"
+                       "                      that pair IS the answer.")
             lines.append(
                 "  NOTE              : N and m were fitted together and are "
                 "almost perfectly anti-correlated\n                      "
@@ -987,6 +1013,8 @@ def material_balance_oil(pressure: np.ndarray,
     m_se = float("nan")
     m_locus = None
     n_locus_range = None
+    m_fit_ok = False
+    m_fit_why_not = ""
     if fit_gas_cap:
         # Scan m on a coarse grid then polish. A one-dimensional search is
         # enough because N is solved exactly for each m, and a grid makes the
@@ -1004,24 +1032,45 @@ def material_balance_oil(pressure: np.ndarray,
             y = tab_g["F_rb"].to_numpy(float)[use]
             costs.append(float(np.sum((y - n_g * x) ** 2)))
         costs = np.asarray(costs, float)
-        best = int(np.argmin(costs))
-        m_in = float(grid[best])
-        # The half-width of the region within 10 % of the minimum cost is a
-        # far more honest error bar than a curvature-based one on an objective
-        # this flat.
-        near = grid[costs <= costs[best] * 1.10]
-        m_se = float(0.5 * (near.max() - near.min())) if near.size > 1 else 0.0
+        m_fit_ok = bool(np.isfinite(costs).any())
+        if m_fit_ok:
+            best = int(np.argmin(costs))
+            # The half-width of the region within 10 % of the minimum cost is
+            # a far more honest error bar than a curvature-based one on an
+            # objective this flat.
+            near = grid[np.isfinite(costs) & (costs <= costs[best] * 1.10)]
+            m_se = (float(0.5 * (near.max() - near.min()))
+                    if near.size > 1 else 0.0)
+            # A 'minimum' that covers most of the scan is not a fit: every m
+            # from none to a gas cap several times the oil zone fits alike.
+            if near.max() - near.min() >= 0.8 * (grid.max() - grid.min()):
+                m_fit_ok = False
+                m_fit_why_not = (
+                    f"every m from {near.min():.1f} to {near.max():.1f} fits "
+                    "the surveys equally well")
+            else:
+                m_in = float(grid[best])
+        else:
+            # Before this check, an all-infinite cost vector sent argmin to
+            # the first grid point, and the report printed 'm 0.0000 +/-
+            # 2.5000 (FITTED)' and an N-m correlation note on a field where
+            # neither N nor m had been fitted.
+            m_fit_why_not = ("fewer than three surveys carry enough "
+                             "depletion at any m")
         # N and m are almost perfectly anti-correlated - measured at -1.00 on
         # a marched tank with 15 psi of survey scatter - so the regression
         # standard error on N, which conditions on the fitted m, is not the
         # uncertainty in N. It read +/-0.3 % where repeated noise realisations
         # moved N by +/-9 %. The honest bar is the spread of N across the m
         # values the data cannot distinguish.
-        n_locus = [_fit_for_m(float(mg))[0] for mg in near]
-        n_locus = [v for v in n_locus if np.isfinite(v)]
-        m_locus = (float(near.min()), float(near.max()))
-        n_locus_range = ((float(np.min(n_locus)), float(np.max(n_locus)))
-                         if len(n_locus) > 1 else None)
+        if m_fit_ok:
+            n_locus = [_fit_for_m(float(mg))[0] for mg in near]
+            n_locus = [v for v in n_locus if np.isfinite(v)]
+            m_locus = (float(near.min()), float(near.max()))
+            n_locus_range = ((float(np.min(n_locus)), float(np.max(n_locus)))
+                             if len(n_locus) > 1 else None)
+        else:
+            m_se = float("nan")
 
     # Where m was ASSUMED rather than fitted, test the assumption.
     #
@@ -1114,6 +1163,25 @@ def material_balance_oil(pressure: np.ndarray,
     spread = ((a_max - a_min) / a_min
               if np.isfinite(a_min) and a_min > 0 else float("nan"))
 
+    # How much depletion the surveys actually saw, for the reader to weigh the
+    # ceiling against. A field that has given up 9 MMstb for a few hundred psi
+    # returns F/Et in the billions of barrels - an arithmetically correct
+    # bound that says nothing, because the expansion term is tiny. Printing
+    # it bare invites it to be read as a number about the reservoir.
+    dp_all = tab["dp"].to_numpy(float)
+    np_all = tab["Np_stb"].to_numpy(float)
+    depletion_note = ""
+    uninformative_ceiling = False
+    if dp_all.size and np.isfinite(dp_all).any():
+        k = int(np.nanargmax(dp_all))
+        np_max = float(np.nanmax(np_all)) if np.isfinite(np_all).any() else 0.0
+        depletion_note = (
+            f"deepest survey is {dp_all[k]:,.0f} psi below p_i "
+            f"({100 * dp_all[k] / max(pi, 1e-9):.0f} %) after "
+            f"{np_all[k] / STB_PER_MSTB:,.0f} Mstb produced")
+        if np.isfinite(ceiling) and np_max > 0 and ceiling > 50.0 * np_max:
+            uninformative_ceiling = True
+
     # The slope is kept as a description of the SHAPE, not as the verdict.
     drift, p_val = float("nan"), float("nan")
     if int(usable.sum()) >= 4:
@@ -1196,7 +1264,10 @@ def material_balance_oil(pressure: np.ndarray,
 
     return MaterialBalanceOil(
         n_ooip_stb=n_hat, n_stderr_stb=n_se, m_gas_cap=m_in,
-        m_fitted=bool(fit_gas_cap), m_stderr=m_se, r2=r2,
+        m_fitted=bool(fit_gas_cap and m_fit_ok), m_stderr=m_se, r2=r2,
+        m_fit_requested=bool(fit_gas_cap), m_fit_why_not=m_fit_why_not,
+        n_uninformative_ceiling=bool(uninformative_ceiling),
+        depletion_note=depletion_note,
         n_surveys=len(p), n_skipped=n_skip, p_initial=pi,
         p_initial_estimated=bool(p_initial_estimated),
         p_initial_source=pi_src,
@@ -2469,7 +2540,11 @@ class RatioModel:
             return f"  {self.label} model        : none ({self.note})"
         if self.kind == "constant":
             return (f"  {self.label} model        : held constant at "
-                    f"{math.exp(self.ln_r0):,.3g} ({self.note})")
+                    f"{math.exp(self.ln_r0):,.3g}"
+                    + ("\n" + textwrap.fill(
+                        self.note, width=100,
+                        initial_indent=" " * 22,
+                        subsequent_indent=" " * 22) if self.note else ""))
         return (f"  {self.label} model        : {self.kind}, "
                 f"{self.pct_per_mmstb:+,.0f} % per MMstb of oil "
                 f"(R2 {self.r2:.2f}, p {self.p_value:.1e}, n={self.n_points})"
@@ -4372,7 +4447,11 @@ def analyse_oil_well(df: "pd.DataFrame | OilProductionData",
         "forecast horizon": f"{t_max_years:,.0f} yr from the last record",
         "material balance": ("on" if use_material_balance else "off"),
         "gas cap m": (f"{m_used:.3f} "
-                      + ("(fitted)" if mb_fit_gas_cap else "(supplied)")),
+                      + (("(fitted)" if (matbal is not None
+                                         and matbal.m_fitted)
+                          else "(fit requested, not determined - "
+                               "value used in its place)")
+                         if mb_fit_gas_cap else "(supplied)")),
         "oil-in-place cap": (f"{n_cap / 1e6:,.1f} MMstb"
                              if n_cap else "not applied"),
         "N hard ceiling": (f"{n_hard_max / 1e6:,.1f} MMstb = min(F/Et)"
@@ -4744,6 +4823,39 @@ def run_self_tests(verbose: bool = True) -> bool:
     check("an undetermined N is said in words, not printed as nan",
           "NOT DETERMINED" in mb_nan.summary()
           and " nan " not in mb_nan.summary())
+
+    # The same record with the gas-cap fit ON. The field report printed
+    # "m 0.0000 +/- 2.5000 (FITTED)" and an N-m anti-correlation note: with
+    # under three usable surveys every m cost infinity, argmin fell on the
+    # first grid point, and the whole grid counted as 'near' the minimum.
+    mb_nf = material_balance_oil(np.array([3493.0, 3350.0, 3200.0]),
+                                 np.array([0.0, 2.0e6, 4.5e6]),
+                                 np.array([0.0, 9.0e8, 2.0e9]), None, pvt_d,
+                                 fit_gas_cap=True, p_initial=3493.0)
+    sm_nf = mb_nf.summary()
+    check("an m that could not be fitted is not reported as FITTED",
+          not mb_nf.m_fitted and "(FITTED)" not in sm_nf
+          and "NOT DETERMINED - fit requested" in sm_nf, sm_nf.splitlines()[5]
+          if len(sm_nf.splitlines()) > 5 else sm_nf)
+    check("no N-m correlation note when neither was fitted",
+          "anti-correlated" not in sm_nf and not np.isfinite(mb_nf.m_stderr))
+    check("the depletion the surveys saw is stated",
+          "depletion seen" in sm_nf and "psi below p_i" in sm_nf)
+    mb_big = material_balance_oil(np.array([3493.0, 3470.0, 3450.0, 3430.0]),
+                                  np.array([0.0, 3.0e6, 6.0e6, 9.0e6]),
+                                  np.array([0.0, 1.2e9, 2.4e9, 3.6e9]), None,
+                                  pvt_d, p_initial=3493.0)
+    check("a ceiling far above the oil produced is called uninformative",
+          mb_big.n_uninformative_ceiling
+          and "constrains nothing" in mb_big.summary(),
+          f"ceiling {mb_big.n_ceiling_stb / 1e6:,.0f} MMstb")
+    check("a normal tank's ceiling is not called uninformative",
+          not mb_w.n_uninformative_ceiling)
+    rm_c = RatioModel(kind="constant", ln_r0=math.log(502.0), label="GOR",
+                      slope_per_stb=0.0, np_ref_stb=0.0,
+                      note="x " * 90)
+    check("a held-constant ratio note is wrapped, not one long line",
+          max(len(ln) for ln in rm_c.summary().splitlines()) <= 110)
 
     # -- 3. the balance inverted ------------------------------------------
     tk = _march_tank(50.0e6, 0.0)
