@@ -373,7 +373,8 @@ with st.sidebar:
              "one curve a weight of 1.000 after seven years of data. On "
              "synthetic wells given a quarter to a third of their life as "
              "history, the band went from containing the eventual outturn in "
-             "2 cases of 18 to 9 of 18.")
+             "2 cases of 18 to 11 of 18 once the curve and the GOR and WOR "
+             "shapes were all sampled.")
 
 settings = (q_econ, model, float(t_max), run_mc, int(n_mc), use_mb, fit_m,
             m_in, mb_pi, mb_skip, cap, wcut_lim, qw_lim, p_ab, rate_basis,
@@ -707,12 +708,16 @@ a well is following.
 This matters more than the parameters do. On synthetic wells marched to
 abandonment and then truncated to a quarter or a third of their life, the
 P90-P10 band contained the eventual outturn in **2 cases of 18** with
-parameters alone, and in **9 of 18** once the choice of curve was sampled as
-well - 4 of the 6 wells where nothing else in the report raised a warning. The
-point estimates did not move; only the honesty of the range did.
+parameters alone, **9 of 18** once the choice of decline curve was sampled,
+and **11 of 18** once the shapes of the GOR and WOR curves were sampled too -
+including **all 6** of the wells where nothing else in the report raised a
+warning. The point estimates barely moved; only the honesty of the range did.
 
-What is still not sampled is the shape of the GOR and WOR curves, and where
-nearly every realisation ends on the same limit the band stops being a spread
+The GOR and WOR are each fitted in five shapes - log-linear, linear, power,
+constant, and for water a logistic on the cut, which cannot run away because a
+water cut cannot exceed one - and a shape that would open the forecast with a
+step away from the recent readings is dropped. Where nearly every realisation
+ends on the same limit the band stops being a spread
 on EUR at all and becomes a spread on the parameters of whichever curve that
 limit is read off - so the report says so rather than letting a +/-1 % band
 speak for itself.

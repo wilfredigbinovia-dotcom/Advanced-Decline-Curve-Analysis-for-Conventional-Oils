@@ -327,6 +327,22 @@ def pvt_physicality_warnings(pvt: "OilPVT", n: int = 400) -> List[str]:
             f"not at {pb:,.0f}.")
     if np.any(np.diff(bg) >= 0):
         out.append("Bg does not fall monotonically with pressure.")
+    # Below the bubble point gas comes out of solution - that is what a
+    # bubble point IS. An Rs that stays flat for hundreds of psi below it
+    # describes an undersaturated oil wearing a bubble point's label, and the
+    # oil expansion term goes to zero across that range.
+    below = p < pb - 2.5 * step
+    if int(below.sum()) >= 3:
+        flat = np.abs(float(pvt.rsi) - rs[below]) < 1e-6 * max(pvt.rsi, 1.0)
+        if int(flat.sum()) >= 3:
+            span = float(pb - np.min(p[below][flat]))
+            if span > 5.0 * step:
+                out.append(
+                    f"Rs stays at Rsi for {span:,.0f} psi BELOW the bubble "
+                    f"point of {pb:,.0f} psia. Gas does not come out of "
+                    f"solution there, so the oil expansion term is zero over "
+                    f"that range. The declared bubble point and Rsi describe "
+                    f"different fluids.")
     if np.any(rs < -1e-9) or np.any(rs > float(pvt.rsi) + 1e-6):
         out.append(f"Rs leaves [0, Rsi]: range "
                    f"{float(np.min(rs)):,.0f} to {float(np.max(rs)):,.0f} "
@@ -439,13 +455,41 @@ class OilPVT:
         """Solution gas-oil ratio, scf/STB. Constant above the bubble point."""
         p = np.asarray(p, dtype=float)
         tab = self._from_table("rs", p)
-        base = (tab if tab is not None
-                else standing_rs(p, self.api, self.gas_gravity,
-                                 self.temperature_F))
+        if tab is not None:
+            base = tab
+        else:
+            base = standing_rs(p, self.api, self.gas_gravity,
+                               self.temperature_F)
+            # The SHAPE comes from the correlation; the ANCHOR comes from the
+            # bubble point. Where the bubble point is derived from Rsi the
+            # two already agree and this factor is 1. Where it is declared
+            # and disagrees, the correlation is rescaled so that Rs(pb) = Rsi.
+            #
+            # Without this, a declared bubble point of 3,493 psia on a fluid
+            # whose Rsi of 391 scf/STB puts Standing's bubble point at 1,673
+            # left Rs pinned at Rsi for 1,820 psi BELOW the bubble point the
+            # user gave: no gas came out of solution, Bo and Bt stayed
+            # constant, and the oil expansion term Eo was identically zero
+            # over the whole range the surveys sat in. The balance then
+            # divided the withdrawal by almost nothing and returned a ceiling
+            # of a billion barrels. The opposite case - a declared bubble
+            # point BELOW the correlation's - put a step in Rs at pb.
+            anchor = float(standing_rs(np.array([float(self.p_bubble)]),
+                                       self.api, self.gas_gravity,
+                                       self.temperature_F)[0])
+            if anchor > 0:
+                base = base * (float(self.rsi) / anchor)
         # Above the bubble point nothing more can dissolve: Rs is pinned at
         # Rsi. Correlations do not know that and will keep climbing.
         return np.where(p >= self.p_bubble, float(self.rsi),
                         np.minimum(base, float(self.rsi)))
+
+    @property
+    def correlation_bubble_point(self) -> float:
+        """The bubble point Standing gives for this Rsi, whatever was declared."""
+        return float(standing_bubble_point(self.rsi, self.api,
+                                           self.gas_gravity,
+                                           self.temperature_F))
 
     def bo(self, p: np.ndarray) -> np.ndarray:
         """Oil formation volume factor, rb/STB, on both sides of the bubble point."""
@@ -543,6 +587,23 @@ class OilPVT:
         ]
         if self.source_note:
             lines.append(f"  note                        : {self.source_note}")
+        # Rsi and the bubble point are two measurements of one thing. When
+        # they disagree by a factor, one of them belongs to another fluid,
+        # and nothing downstream can tell which - so it is said here.
+        if not self._table_cols:
+            pb_c = self.correlation_bubble_point
+            if (np.isfinite(pb_c) and pb_c > 0
+                    and abs(self.p_bubble - pb_c) / pb_c > 0.25):
+                lines.append(
+                    f"  CHECK Rsi AND pb            : Standing puts the bubble "
+                    f"point for Rsi {self.rsi:,.0f} at {pb_c:,.0f} psia;\n"
+                    f"                                {self.p_bubble:,.0f} "
+                    f"was used ({self.p_bubble / pb_c:.2f}x). Rs is anchored "
+                    f"to the bubble point used,\n"
+                    f"                                so the two agree, but "
+                    f"one of the inputs probably belongs to another\n"
+                    f"                                fluid - and the "
+                    f"material balance is only as right as whichever it is.")
         # Where the correlations are being extrapolated, say so once, next to
         # the properties they produced. They still return numbers outside
         # their range - they are smooth functions - and those numbers carry
@@ -686,10 +747,13 @@ class MaterialBalanceOil:
             lines.append(f"  NOTE              : {self.note}")
             return "\n".join(lines)
         lines += [
-            f"  OOIP (N)          : {self.n_ooip_mstb:,.0f} Mstb"
-            + (f" +/- {self.n_stderr_stb / STB_PER_MSTB:,.0f}"
-               if np.isfinite(self.n_stderr_stb) else ""),
-            f"  R2                : {self.r2:.4f}",
+            (f"  OOIP (N)          : {self.n_ooip_mstb:,.0f} Mstb"
+             + (f" +/- {self.n_stderr_stb / STB_PER_MSTB:,.0f}"
+                if np.isfinite(self.n_stderr_stb) else ""))
+            if np.isfinite(self.n_ooip_stb) else
+            "  OOIP (N)          : NOT DETERMINED - see the drive note below",
+            (f"  R2                : {self.r2:.4f}" if np.isfinite(self.r2)
+             else "  R2                : -"),
             f"  gas cap m         : {self.m_gas_cap:.4f}"
             + (f" +/- {self.m_stderr:.4f}  (FITTED)" if self.m_fitted
                else "  (as entered)")
@@ -711,11 +775,16 @@ class MaterialBalanceOil:
                 f"its expansion, and the error runs to an order of magnitude. "
                 f"Set m\n                      from structure and logs, or "
                 f"turn on the gas-cap fit, before using N."]
+        n_ceil_pts = (int(self.ho_table["apparent_N_usable"].sum())
+                      if self.ho_table is not None
+                      and "apparent_N_usable" in self.ho_table else 0)
         lines += [
             f"  N ceiling, We>=0  : {self.n_ceiling_stb / STB_PER_MSTB:,.0f} "
             "Mstb = min(F/Et)"
             + (f"   ({self.n_thin_dp} early survey(s) excluded: too little "
-               f"depletion to read F/Et)" if self.n_thin_dp else ""),
+               f"depletion to read F/Et)" if self.n_thin_dp else "")
+            + (f"\n                      from {n_ceil_pts} survey(s) only - "
+               "a bound, but a loose one" if 0 < n_ceil_pts < 3 else ""),
         ]
         if np.isfinite(self.apparent_n_spread):
             lines.append(
@@ -737,7 +806,9 @@ class MaterialBalanceOil:
                 "ceiling. Something outside the\n                      "
                 "bracket is supplying volume - water influx, or a gas cap "
                 "larger than assumed.")
-        if self.n_rel_se > N_MAX_REL_SE:
+        if not np.isfinite(self.n_ooip_stb):
+            pass                        # the drive note already says why
+        elif self.n_rel_se > N_MAX_REL_SE:
             lines.append(
                 f"  WARNING           : N carries a standard error of "
                 f"{100 * self.n_rel_se:.0f} %, which is not a number\n"
@@ -1066,9 +1137,26 @@ def material_balance_oil(pressure: np.ndarray,
         else:
             n_se = se_from_surveys
 
-    if not np.isfinite(spread):
-        drive, note = "unknown", ("too few usable surveys to read apparent "
-                                  "oil in place.")
+    n_usable = int(usable.sum())
+    if not np.isfinite(n_hat) or n_hat <= 0:
+        # No N, so no verdict about it. The first version went on to compute
+        # a spread from whatever surveys were left and printed "volumetric -
+        # the fitted N can be read as oil in place" two lines under
+        # "OOIP (N): nan", on a field where N could not be fitted at all.
+        drive = "undetermined"
+        note = (f"N could not be fitted: {n_usable} survey(s) carry enough "
+                f"depletion to read F/Et, and a\n                      line "
+                "through the origin needs three. Nothing here - the spread, "
+                "the ceiling, the\n                      drive - is evidence "
+                "about oil in place until there are more surveys below p_i.")
+        spread = float("nan")
+    elif n_usable < 3 or not np.isfinite(spread):
+        drive = "undetermined"
+        note = (f"only {n_usable} survey(s) carry enough depletion to read "
+                "F/Et. A spread needs at\n                      least three "
+                "points to mean anything; with fewer, 'the surveys agree' "
+                "is\n                      true of any two numbers.")
+        spread = float("nan")
     elif spread <= APPARENT_N_SPREAD and gas_cap_indicated:
         # The apparent-N sequence can look flat and the N still be wrong by
         # an order of magnitude, because a gas cap that is assumed away is
@@ -1533,6 +1621,7 @@ class GORDiagnostic:
     ratio_recent: float = float("nan")      # recent GOR / Rsi
     break_np_stb: Optional[float] = None    # cumulative at the GOR break
     break_frac_of_record: float = float("nan")
+    gor_max_single: float = float("nan")    # highest single month
     peaked: bool = False                    # GOR has turned over
     peak_np_stb: Optional[float] = None
     scatter_frac: float = float("nan")      # robust noise / plateau level
@@ -1551,6 +1640,17 @@ class GORDiagnostic:
             f"  GOR diagnostic    : early {self.gor_initial:,.0f}, recent "
             f"{self.gor_recent:,.0f}, peak {self.gor_max:,.0f} scf/STB "
             f"(Rsi {self.rsi:,.0f})"]
+        # The peak quoted above is the SUSTAINED one. A single month far above
+        # it is a metering spike or a test, and is named as such rather than
+        # being quoted as the peak - 3,636 on a series running 350 to 500 was.
+        if (np.isfinite(self.gor_max_single) and np.isfinite(self.gor_max)
+                and self.gor_max_single > 1.5 * self.gor_max):
+            lines.append(
+                f"                      highest single month "
+                f"{self.gor_max_single:,.0f} scf/STB is "
+                f"{self.gor_max_single / self.gor_max:.1f}x the sustained "
+                "peak - a spike, not\n                      reservoir "
+                "behaviour, and not used as the GOR peak.")
         if self.broke:
             lines.append(
                 f"                      GOR breaks upward at Np = "
@@ -1646,8 +1746,34 @@ def gor_diagnostic(gor: np.ndarray, np_stb: np.ndarray, rsi: float,
     if len(g) >= 5:
         sm[1:-1] = np.array([np.median(g[j - 1:j + 2])
                              for j in range(1, len(g) - 1)])
-    pk = int(np.argmax(sm))
-    peaked = pk < len(g) - 3 and float(sm[pk]) > float(sm[-1]) * 1.10
+
+    # The PEAK is found on a much wider median than the break. A 3-point
+    # median cannot remove a spike two months long, and one on a field
+    # record - 3,636 scf/STB in a series running 350 to 500 - was read as
+    # the physical GOR peak: the report declared solution-gas drive spent on
+    # a GOR that was still rising, and the forecast was fitted to the 24
+    # points after the spike, where its leverage made the slope anything at
+    # all. A genuine solution-gas peak is a limb lasting years; a window of
+    # about a twentieth of the record keeps it and removes the spike.
+    w_pk = max(5, (len(g) // 20) | 1)
+    h = w_pk // 2
+    sm_pk = np.array([np.median(g[max(0, j - h):j + h + 1])
+                      for j in range(len(g))])
+    # The peak is placed at the END of the top plateau, not at its argmax.
+    # A wide median flattens the broad top of a real solution-gas peak, and
+    # argmax then picks the FIRST of several near-equal values: on one
+    # synthetic well it returned index 19 where the GOR actually turned over
+    # at 49, which cut the rising limb to twenty points and cost the break
+    # test its power - two wells that had crossed their bubble point were
+    # reported as not having done so. The end of the plateau is also where
+    # the falling limb genuinely begins, which is what the GOR fit needs.
+    top = float(np.max(sm_pk))
+    on_top = np.flatnonzero(sm_pk >= 0.95 * top)
+    pk = int(on_top[-1]) if on_top.size else int(np.argmax(sm_pk))
+    # Sustained, not merely highest: the turn-over must be visible on the
+    # wide median too, and there must be a falling limb long enough to fit.
+    peaked = (pk < len(g) - max(8, w_pk)
+              and top > float(np.median(g[-w_pk:])) * 1.10)
 
     # The limb the scan sees: up to the peak if the GOR has turned over,
     # otherwise the whole record.
@@ -1731,7 +1857,8 @@ def gor_diagnostic(gor: np.ndarray, np_stb: np.ndarray, rsi: float,
                          and float(np.mean(after)) > float(np.mean(before)))
 
     return GORDiagnostic(
-        ok=True, gor_initial=g0, rsi=float(rsi), gor_max=float(np.max(g)),
+        ok=True, gor_initial=g0, rsi=float(rsi),
+        gor_max=float(np.max(sm_pk)), gor_max_single=float(np.max(g)),
         gor_recent=g_recent,
         ratio_recent=(g_recent / float(rsi)) if rsi > 0 else float("nan"),
         break_np_stb=(float(n[best_i]) if broke else None),
@@ -2484,10 +2611,42 @@ def fit_ratio_shapes(np_stb: np.ndarray, ratio: np.ndarray, label: str,
                                    "median")
         return {"constant": m} if m is not None else {}
     out: Dict[str, RatioModel] = {}
+    # Where the well IS now: the median of the last handful of readings. A
+    # shape whose value at the last cumulative is far from this does not
+    # describe the current state of the well, whatever its R2 - the forecast
+    # would open with a step. On a field record the linear GOR shape began
+    # its forecast at 70 scf/STB against a measured 480.
+    n_recent = max(5, min(12, n // 6))
+    recent = float(np.median(rs_[-n_recent:]))
+    dropped: List[str] = []
     for kind in shapes:
         m = _fit_one_shape(xs, rs_, kind, label, floor, ceiling, note)
-        if m is not None and np.isfinite(m.log_rss):
-            out[kind] = m
+        if m is None or not np.isfinite(m.log_rss):
+            continue
+        v_now = float(m(xs[-1:])[0])
+        if (kind != "constant" and recent > 0 and np.isfinite(v_now)
+                and abs(math.log(max(v_now, 1e-12) / recent)) > math.log(1.35)):
+            dropped.append(f"{kind} ({v_now:,.3g} vs {recent:,.3g})")
+            continue
+        out[kind] = m
+    if not out:
+        # Every trend opened with a step. Hold the ratio where it is and say
+        # so, rather than forecast from a curve that does not pass through
+        # the present.
+        m = _fit_one_shape(xs, rs_, "constant", label, floor, ceiling,
+                           (note + "; " if note else "")
+                           + "every trend shape started far from the recent "
+                             "readings, so the ratio is held at its recent "
+                             "level")
+        if m is not None:
+            m = replace(m, ln_r0=float(math.log(max(recent, 1e-12))))
+            out["constant"] = m
+    elif dropped:
+        for k in out:
+            out[k] = replace(out[k], note=(out[k].note + "; " if out[k].note
+                                           else "")
+                             + "dropped for opening with a step: "
+                             + ", ".join(dropped))
     return out
 
 
@@ -2582,6 +2741,26 @@ def fit_gor_model(np_stb: np.ndarray, gor: np.ndarray, pvt: OilPVT,
     floor = 0.10 * float(pvt.rsi)
     shapes = fit_ratio_shapes(x, g, "GOR", window=window,
                               min_points=min_points, floor=floor, note=note)
+    # A shape fitted to the falling limb that then forecasts a RISE has not
+    # described the falling limb - it has described whatever noise sat in the
+    # window. On one field record a "falling limb" fit came back at +1,758 %
+    # per MMstb and the report printed the two side by side without comment,
+    # while the gas forecast ran to 3.7 times the recent GOR.
+    if diag is not None and diag.ok and diag.peaked and shapes:
+        rising = [k for k, m in shapes.items()
+                  if k != "constant" and m.pct_per_mmstb > 0]
+        if rising and len(rising) < len(shapes):
+            shapes = {k: m for k, m in shapes.items() if k not in rising}
+        elif rising:
+            recent = float(np.median(g[np.isfinite(g) & (g > 0)][-8:]))
+            shapes = {"constant": RatioModel(
+                kind="constant", label="GOR",
+                ln_r0=float(math.log(max(recent, 1e-12))),
+                slope_per_stb=0.0, np_ref_stb=float(x[-1]),
+                n_points=int(np.isfinite(g).sum()), floor=floor,
+                note="every shape fitted to the falling limb forecast a "
+                     "RISE, which contradicts the limb; held at the recent "
+                     "level instead")}
     if not shapes:
         return _fit_ratio_model(x, g, "GOR", min_points=min_points,
                                 window=window, floor=floor, note=note), {}
@@ -3586,8 +3765,8 @@ def summarise_oil_mc(mc: pd.DataFrame, deterministic: OilForecast,
                 "                      curves. On synthetic wells given a "
                 "quarter to a third of their life as\n"
                 "                      history it contained the eventual "
-                "outturn in 9 cases of 18 - and in 4 of the\n"
-                "                      6 where nothing else in the report "
+                "outturn in 11 cases of 18 - and in all 6\n"
+                "                      where nothing else in the report "
                 "raised a warning. It is a range worth\n"
                 "                      quoting, not a guarantee.")
         else:
@@ -3598,8 +3777,8 @@ def summarise_oil_mc(mc: pd.DataFrame, deterministic: OilForecast,
                 "usually the larger term: sampled the same\n"
                 "                      way on synthetic wells, this band "
                 "contained the eventual outturn in 2 cases\n"
-                "                      of 18, against 9 of 18 once the "
-                "choice of curve was sampled as well.")
+                "                      of 18, against 11 of 18 once the "
+                "choice of curve and ratio shape were sampled.")
     if n_requested and len(mc) < 0.5 * n_requested:
         lines.append(
             f"                      only {len(mc)} of {n_requested} draws "
@@ -3873,6 +4052,46 @@ class OilWellResult:
                          "that are each significant.")
             lines.append("             The forecast is a consequence of where "
                          "the window starts, not of the well.")
+
+        # A sign change was the only thing checked for. On one field the last
+        # quarter of the record declined at -18.3 %/yr, significant at
+        # p = 1e-10, against -3.5 %/yr over the fitted window - five times
+        # steeper - and nothing was said. The fit had b pinned at 2 and a
+        # terminal decline of 2.5 %/yr, reached the economic limit in 113
+        # years, and ran the whole forecast to the horizon. The recent trend
+        # is the best available evidence of the regime the well is in now;
+        # when it disagrees with the curve being extrapolated by a factor,
+        # that is the headline, not a line in a table.
+        try:
+            fw = ws[ws["window"].astype(str).str.startswith("fitted")]
+            late = ws[ws["window"].astype(str).str.startswith(
+                ("last quarter", "last half"))]
+            if len(fw):
+                f_tr = float(fw["trend_pct_yr"].iloc[0])
+                for _, r in late.iterrows():
+                    l_tr = float(r["trend_pct_yr"])
+                    if (float(r["p_value"]) < 0.01 and f_tr < 0 and l_tr < 0
+                            and abs(l_tr) > 2.0 * abs(f_tr)):
+                        lines.append(
+                            f"    WARNING: over the {r['window']} the rate "
+                            f"falls {abs(l_tr):.1f} %/yr - "
+                            f"{abs(l_tr) / abs(f_tr):.1f}x the "
+                            f"{abs(f_tr):.1f} %/yr of the fitted window.")
+                        lines.append(
+                            "             The well is declining faster now "
+                            "than the curve being forecast. Refit from later "
+                            "in the\n             record, or treat the "
+                            "EUR below as an upper bound.")
+                        break
+                    if (float(r["p_value"]) < 0.01 and f_tr < 0 and l_tr < 0
+                            and abs(l_tr) < 0.5 * abs(f_tr)):
+                        lines.append(
+                            f"    NOTE: over the {r['window']} the decline has "
+                            f"slowed to {abs(l_tr):.1f} %/yr, under half the "
+                            f"fitted {abs(f_tr):.1f} %/yr.")
+                        break
+        except Exception:
+            pass
         return "\n".join(lines)
 
     def report(self) -> str:
@@ -4407,6 +4626,44 @@ def run_self_tests(verbose: bool = True) -> bool:
     check("the base fluid is classified as a black oil",
           fluid_class(pvt) == "black oil")
 
+    # -- 1c. a declared bubble point that disagrees with Rsi ---------------
+    #
+    # A field report declared pb = 3,493 psia on a fluid whose Rsi of 391
+    # scf/STB puts Standing's bubble point at 1,673. Rs was then pinned at Rsi
+    # for 1,820 psi below the declared bubble point, the oil expansion term was
+    # identically zero across that range, and the material balance returned a
+    # ceiling of a billion barrels.
+    pvt_d = OilPVT(api=35.0, gas_gravity=0.70, temperature_F=140.0,
+                   rsi=391.0, p_init=3493.0, p_bubble=3493.0, sw_initial=0.22)
+    rs_below = pvt_d.rs(np.array([3200.0, 2400.0]))
+    check("gas comes out of solution below a DECLARED bubble point",
+          bool(rs_below[0] < pvt_d.rsi - 1.0 and rs_below[1] < rs_below[0]),
+          f"Rs {rs_below[0]:,.0f} and {rs_below[1]:,.0f} scf/STB below pb")
+    check("Rs is continuous at a declared bubble point",
+          abs(float(pvt_d.rs(np.array([3493.0 - 0.5]))[0]) - pvt_d.rsi) < 1.0)
+    eo_below = float(pvt_d.bt(np.array([3000.0]))[0]) - pvt_d.bti
+    check("the oil expansion term is not zero below a declared pb",
+          eo_below > 1e-3, f"Eo at 3,000 psia = {eo_below:.5f} rb/STB")
+    check("a bubble point far from the correlation's is flagged",
+          "CHECK Rsi AND pb" in pvt_d.summary())
+    check("the base fluid's Rs is unchanged by the anchoring",
+          float(np.max(np.abs(pvt.rs(np.linspace(300.0, pb - 5.0, 40))
+                              - np.minimum(standing_rs(
+                                  np.linspace(300.0, pb - 5.0, 40), pvt.api,
+                                  pvt.gas_gravity, pvt.temperature_F),
+                                  pvt.rsi)))) < 1e-6)
+    # And the physicality check must catch a flat Rs below pb from ANY source,
+    # e.g. a user table - the correlation path is now anchored, so a table is
+    # the only way left to produce it.
+    flat_tab = pd.DataFrame({"pressure": [500.0, 1500.0, 2500.0, 3493.0],
+                             "rs": [391.0, 391.0, 391.0, 391.0]})
+    pvt_flat = OilPVT(api=35.0, gas_gravity=0.70, temperature_F=140.0,
+                      rsi=391.0, p_init=3493.0, p_bubble=3493.0,
+                      sw_initial=0.22, pvt_table=flat_tab)
+    check("an Rs that stays at Rsi below the bubble point is reported",
+          any("BELOW the bubble" in w
+              for w in pvt_physicality_warnings(pvt_flat)))
+
     # -- 2. material balance ----------------------------------------------
     for m_true in (0.0, 0.40):
         tk = _march_tank(50.0e6, m_true)
@@ -4472,6 +4729,22 @@ def run_self_tests(verbose: bool = True) -> bool:
           f"+/-{mb_p.n_stderr_stb / 1e3:,.0f} Mstb on a "
           f"{100 * mb_p.apparent_n_spread:.1f} % spread")
 
+    # An N that could not be fitted must not be followed by a verdict about
+    # it. The field report printed "the fitted N can be read as oil in place"
+    # two lines under "OOIP (N): nan".
+    mb_nan = material_balance_oil(np.array([3493.0, 3350.0, 3200.0]),
+                                  np.array([0.0, 2.0e6, 4.5e6]),
+                                  np.array([0.0, 9.0e8, 2.0e9]), None, pvt_d,
+                                  m_gas_cap=0.358, p_initial=3493.0)
+    check("an undetermined N gets no drive verdict",
+          not np.isfinite(mb_nan.n_ooip_stb)
+          and mb_nan.drive == "undetermined"
+          and "can be read as oil" not in mb_nan.summary(),
+          mb_nan.drive)
+    check("an undetermined N is said in words, not printed as nan",
+          "NOT DETERMINED" in mb_nan.summary()
+          and " nan " not in mb_nan.summary())
+
     # -- 3. the balance inverted ------------------------------------------
     tk = _march_tank(50.0e6, 0.0)
     j = len(tk["p"]) // 2
@@ -4531,6 +4804,29 @@ def run_self_tests(verbose: bool = True) -> bool:
         got = -pid.trend_pct_per_year
         check(f"PI trend recovered, truth {100 * truth:.0f} %/yr nominal",
               abs(got - want) < 1.0, f"{got:+.2f} vs {want:+.2f} %/yr")
+
+    # A two-month GOR spike is not a solution-gas peak. On a field record
+    # one was read as the peak, "solution-gas drive is spent" was printed on
+    # a GOR still rising, and the forecast was fitted to the 24 points after
+    # the spike.
+    rng_s = np.random.default_rng(4)
+    np_s = np.linspace(0.05e6, 9.47e6, 380)
+    g_s = (350.0 + 150.0 * (np_s / np_s[-1]) ** 2) * rng_s.lognormal(
+        0, 0.12, 380)
+    k_s = int(np.searchsorted(np_s, 8.89e6))
+    g_s[k_s:k_s + 2] = [3636.0, 2900.0]
+    gd_s = gor_diagnostic(g_s, np_s, 391.0)
+    check("a two-month GOR spike is not read as the GOR peak",
+          not gd_s.peaked, f"peaked={gd_s.peaked}")
+    check("the spike is named as a spike",
+          "a spike, not" in gd_s.summary())
+    gm_s, gsh_s = fit_gor_model(np_s, g_s, pvt_d, diag=gd_s)
+    recent_s = float(np.median(g_s[-10:]))
+    check("every GOR shape opens its forecast near the recent readings",
+          all(abs(math.log(float(m(np_s[-1:])[0]) / recent_s))
+              <= math.log(1.35) + 1e-9 for m in gsh_s.values()),
+          ", ".join(f"{k} {float(m(np_s[-1:])[0]):,.0f}"
+                    for k, m in gsh_s.items()) + f" vs {recent_s:,.0f}")
 
     # -- 5. ratio models ---------------------------------------------------
     npx = np.linspace(1.0e6, 20.0e6, 60)
@@ -4749,6 +5045,26 @@ def run_self_tests(verbose: bool = True) -> bool:
         check("the deterministic case still lies inside the wider band",
               lo <= det_mf.eur_oil_mstb <= hi,
               f"{det_mf.eur_oil_mstb:,.0f} in [{lo:,.0f}, {hi:,.0f}]")
+
+    # A well declining much faster now than the curve being forecast. The
+    # only check was for a SIGN change, and a last quarter five times steeper
+    # than the fitted window went unmentioned on a field record.
+    rng_w = np.random.default_rng(2)
+    t_w = np.arange(240) * 30.44
+    q_w = np.where(t_w < 1.5 * 365, 3000.0,
+                   3000.0 * np.exp(-0.035 * (t_w - 1.5 * 365) / 365))
+    i75 = int(0.75 * 240)
+    q_w = np.where(t_w > t_w[i75],
+                   q_w[i75] * np.exp(-0.20 * (t_w - t_w[i75]) / 365), q_w)
+    q_w = q_w * rng_w.lognormal(0, 0.08, 240)
+    df_w = pd.DataFrame({"date": pd.date_range("2000-01-01", periods=240,
+                                               freq="MS"),
+                         "q_oil": q_w, "q_gas": q_w * 0.6,
+                         "q_water": q_w * 0.3, "days_on": 30.0})
+    r_w = analyse_oil_well(df_w, pvt, well="LATE", q_econ_stbd=50.0,
+                           run_monte_carlo=False)
+    check("a late decline much steeper than the fit is warned about",
+          "declining faster now" in r_w._window_block())
 
     # -- 8. QC -------------------------------------------------------------
     raw = wl.copy()
