@@ -1699,6 +1699,10 @@ class GORDiagnostic:
     n_points: int = 0
     below_rsi_fraction: float = float("nan")
     reason: str = ""
+    # Saturated at discovery: the reservoir starts AT its bubble point, so a
+    # later GOR break cannot be the bubble-point crossing. It is the free gas
+    # reaching critical saturation and starting to flow.
+    saturated: bool = False
 
     @property
     def broke(self) -> bool:
@@ -1722,13 +1726,36 @@ class GORDiagnostic:
                 f"{self.gor_max_single / self.gor_max:.1f}x the sustained "
                 "peak - a spike, not\n                      reservoir "
                 "behaviour, and not used as the GOR peak.")
-        if self.broke:
+        if self.broke and self.saturated:
+            # The field report said "that is the reservoir crossing its
+            # bubble point" twenty lines below "SATURATED at discovery".
+            lines.append(
+                f"                      GOR breaks upward at Np = "
+                f"{self.break_np_stb / STB_PER_MSTB:,.0f} Mstb "
+                f"({100 * self.break_frac_of_record:.0f} % of the record). "
+                "The reservoir was\n                      saturated at "
+                "discovery, so this is not the bubble point: it is the free "
+                "gas\n                      reaching critical saturation "
+                "and starting to flow.")
+        elif self.broke:
             lines.append(
                 f"                      GOR breaks upward at Np = "
                 f"{self.break_np_stb / STB_PER_MSTB:,.0f} Mstb "
                 f"({100 * self.break_frac_of_record:.0f} % of the record): "
                 "that is the\n                      reservoir crossing its "
                 "bubble point, read from surface data alone.")
+        elif self.peaked and self.saturated:
+            lines.append(
+                "                      the GOR has already peaked and is "
+                "falling; the rising limb is not\n                      "
+                "clean enough to date when free gas began to flow.")
+        elif self.saturated:
+            lines.append(
+                "                      no upward break: the reservoir was "
+                "saturated at discovery, but free\n                      "
+                "gas has not yet reached critical saturation over this "
+                "record, or the gas\n                      measurement is "
+                "too noisy to show it.")
         elif self.peaked:
             lines.append(
                 "                      the GOR has already peaked and is "
@@ -1785,7 +1812,8 @@ class GORDiagnostic:
 
 def gor_diagnostic(gor: np.ndarray, np_stb: np.ndarray, rsi: float,
                    early_frac: float = 0.15,
-                   recent_periods: int = 12) -> GORDiagnostic:
+                   recent_periods: int = 12,
+                   saturated: bool = False) -> GORDiagnostic:
     """Find the bubble-point break in the producing GOR, if there is one."""
     g = np.asarray(gor, dtype=float)
     n = np.asarray(np_stb, dtype=float)
@@ -1928,7 +1956,7 @@ def gor_diagnostic(gor: np.ndarray, np_stb: np.ndarray, rsi: float,
                          and float(np.mean(after)) > float(np.mean(before)))
 
     return GORDiagnostic(
-        ok=True, gor_initial=g0, rsi=float(rsi),
+        ok=True, saturated=bool(saturated), gor_initial=g0, rsi=float(rsi),
         gor_max=float(np.max(sm_pk)), gor_max_single=float(np.max(g)),
         gor_recent=g_recent,
         ratio_recent=(g_recent / float(rsi)) if rsi > 0 else float("nan"),
@@ -2537,7 +2565,11 @@ class RatioModel:
 
     def summary(self) -> str:
         if self.kind == "none":
-            return f"  {self.label} model        : none ({self.note})"
+            return (f"  {self.label} model        : none"
+                    + ("\n" + textwrap.fill(
+                        self.note, width=100,
+                        initial_indent=" " * 22,
+                        subsequent_indent=" " * 22) if self.note else ""))
         if self.kind == "constant":
             return (f"  {self.label} model        : held constant at "
                     f"{math.exp(self.ln_r0):,.3g}"
@@ -2909,6 +2941,11 @@ class OilForecast:
     abandonment_reason: str
     constraint_years: Dict[str, float] = field(default_factory=dict)
     constraints_breached_at_start: List[str] = field(default_factory=list)
+    # Limits the user set that could not be applied, with the reason. An
+    # abandonment pressure needs a fitted N to turn production into pressure;
+    # without one it was dropped without a word, and the report listed the
+    # 1,000 psia in its settings as if it had shaped the forecast.
+    constraints_not_applied: Dict[str, str] = field(default_factory=dict)
     recovery_factor: float = float("nan")
     gas_cap_fraction: float = float("nan")   # Gp at EUR / gas originally there
     p_implied_end_psia: float = float("nan")
@@ -2987,6 +3024,13 @@ class OilForecast:
                     "one the fitted curve does not reach\n                   "
                     "   within 200 years. That is a statement about the fit, "
                     "not about the well.")
+        for k, why in self.constraints_not_applied.items():
+            lines.append(
+                textwrap.fill(f"NOT APPLIED       : {k} - {why}.",
+                              width=100, initial_indent="  ",
+                              subsequent_indent=" " * 22)
+                + "\n                      The forecast above ran without "
+                  "this limit.")
         if self.constraints_breached_at_start:
             lines.append(
                 "                      ALREADY PAST: "
@@ -3112,7 +3156,8 @@ def forecast_oil(fit: FitResult,
                  water_cut_econ: Optional[float] = None,
                  q_water_econ_stbd: Optional[float] = None,
                  p_abandon_psia: Optional[float] = None,
-                 q_liquid_cap_stbd: Optional[float] = None) -> OilForecast:
+                 q_liquid_cap_stbd: Optional[float] = None,
+                 n_pressure_stb: Optional[float] = None) -> OilForecast:
     """Roll the oil decline forward and carry gas and water on it.
 
     `t_max_years` is the length of the FORECAST, measured from the last
@@ -3292,11 +3337,24 @@ def forecast_oil(fit: FitResult,
     # output whose job is to be a reality check.
     p_end = float("nan")
     p_source = ""
-    if (n_ooip_stb is not None and np.isfinite(n_ooip_stb)
-            and n_ooip_stb > 0 and len(t) >= 2):
+    not_applied: Dict[str, str] = {}
+    # The N used to turn production into pressure. It defaults to the
+    # oil-in-place CAP, but the two are different jobs: with the cap turned
+    # off the first version had no N here at all, so a fitted N sat in the
+    # material balance while the abandonment pressure was skipped unsaid.
+    n_p = n_pressure_stb if n_pressure_stb is not None else n_ooip_stb
+    want_p_limit = (p_abandon_psia is not None
+                    and np.isfinite(p_abandon_psia) and p_abandon_psia > 0)
+    if want_p_limit and not (n_p is not None
+                             and np.isfinite(n_p) and n_p > 0):
+        not_applied["abandonment pressure"] = (
+            "needs an oil in place to turn production into pressure, and the "
+            "material balance did not determine one")
+    if (n_p is not None and np.isfinite(n_p)
+            and n_p > 0 and len(t) >= 2):
         def _p_on(grid_np, grid_gp, grid_wp):
             vals = pressure_path_from_balance(
-                pvt, float(n_ooip_stb), float(m_gas_cap),
+                pvt, float(n_p), float(m_gas_cap),
                 float(we_to_date_rb), grid_np,
                 grid_gp * MSCF_PER_MMSCF * SCF_PER_MSCF,
                 grid_wp * STB_PER_MSTB)
@@ -3324,6 +3382,10 @@ def forecast_oil(fit: FitResult,
                             "aquifer frozen at its influx to date")
                 _apply("reservoir pressure", "", float(p_abandon_psia),
                        above=False, probe_series=p_prb, window_series=p_win)
+            else:
+                not_applied["abandonment pressure"] = (
+                    "the balance could not be inverted for pressure on this "
+                    "forecast")
         else:
             p_source = ("balance inverted on the fitted N, with the aquifer "
                         "frozen at its influx to date")
@@ -3352,7 +3414,7 @@ def forecast_oil(fit: FitResult,
 
     if p_source:
         p_end = _pressure_from_balance(
-            pvt, float(n_ooip_stb), float(m_gas_cap), float(we_to_date_rb),
+            pvt, float(n_p), float(m_gas_cap), float(we_to_date_rb),
             float(np_stb[-1]),
             float(gp_mmscf[-1] * MSCF_PER_MMSCF * SCF_PER_MSCF),
             float(wp_mstb[-1] * STB_PER_MSTB))
@@ -3428,6 +3490,7 @@ def forecast_oil(fit: FitResult,
         abandonment_reason=reason,
         constraint_years=constraint_years,
         constraints_breached_at_start=breached,
+        constraints_not_applied=not_applied,
         recovery_factor=(float(np_mstb[-1] * STB_PER_MSTB / n_ooip_stb)
                          if n_ooip_stb else float("nan")),
         gas_cap_fraction=(float(gp_mmscf[-1] / g_total_mmscf)
@@ -3545,6 +3608,7 @@ def monte_carlo_oil_eur(fit: FitResult,
                         q_water_econ_stbd: Optional[float] = None,
                         p_abandon_psia: Optional[float] = None,
                         q_liquid_cap_stbd: Optional[float] = None,
+                        n_pressure_stb: Optional[float] = None,
                         max_rel_sd: float = 0.35,
                         seed: int = 11) -> pd.DataFrame:
     """Probabilistic oil EUR: fit covariance, ratio-model scatter, N scatter.
@@ -3677,6 +3741,10 @@ def monte_carlo_oil_eur(fit: FitResult,
                                 and np.isfinite(n_ooip_hard_max)):
                             cap = min(cap, float(n_ooip_hard_max))
                         cap = max(cap, np_to_date_stb * 1.01)
+                    n_pr = None
+                    if n_pressure_stb is not None and np.isfinite(n_pressure_stb):
+                        n_pr = max(float(n_pressure_stb * rng.lognormal(
+                            0.0, n_ooip_rel_sigma)), np_to_date_stb * 1.01)
                     fc = forecast_oil(
                         fr, g_draw.perturb(rng), w_draw.perturb(rng), pvt,
                         q_econ_stbd,
@@ -3689,7 +3757,8 @@ def monte_carlo_oil_eur(fit: FitResult,
                         water_cut_econ=water_cut_econ,
                         q_water_econ_stbd=q_water_econ_stbd,
                         p_abandon_psia=p_abandon_psia,
-                        q_liquid_cap_stbd=q_liquid_cap_stbd)
+                        q_liquid_cap_stbd=q_liquid_cap_stbd,
+                        n_pressure_stb=n_pr)
                 except (ValueError, ArithmeticError, RuntimeError,
                         FloatingPointError):
                     # Numerical failures on an extreme draw are expected and
@@ -3834,7 +3903,9 @@ def summarise_oil_mc(mc: pd.DataFrame, deterministic: OilForecast,
                         for k, v in vc2.items() if v >= 0.02))
         if mix:
             lines.append(
-                f"                      Sampled: {mix}.\n"
+                textwrap.fill(f"Sampled: {mix}.", width=100,
+                              initial_indent=" " * 22,
+                              subsequent_indent=" " * 22) + "\n"
                 f"                      The +/-{band:.1f} % band covers both "
                 "the parameters and the disagreement between\n"
                 "                      curves. On synthetic wells given a "
@@ -4282,7 +4353,8 @@ def analyse_oil_well(df: "pd.DataFrame | OilProductionData",
     # -- diagnostics ------------------------------------------------------
     gor_diag = water_diag = pi_diag = None
     try:
-        gor_diag = gor_diagnostic(data.gor, data.Np, pvt.rsi)
+        gor_diag = gor_diagnostic(data.gor, data.Np, pvt.rsi,
+                                  saturated=bool(pvt.saturated_at_discovery))
     except Exception as exc:
         warnings.warn(f"[{well}] GOR diagnostic failed: {exc}")
     try:
@@ -4307,8 +4379,14 @@ def analyse_oil_well(df: "pd.DataFrame | OilProductionData",
                     p_initial=mb_p_initial, skip_early=mb_skip_early)
             except Exception as exc:
                 warnings.warn(f"[{well}] material balance failed: {exc}")
+    n_press = None
     if matbal is not None and matbal.trend_ok and np.isfinite(matbal.n_ooip_stb):
         m_used = float(matbal.m_gas_cap)
+        # With the oil-in-place cap off, the fitted N (at the m it was fitted
+        # with) still turns production into pressure for the abandonment
+        # limit and the implied end pressure.
+        if not apply_ooip_cap and matbal.n_ooip_stb > 0:
+            n_press = float(matbal.n_ooip_stb)
         we_to_date = (float(matbal.we_implied_rb)
                       if np.isfinite(matbal.we_implied_rb) else 0.0)
         if apply_ooip_cap:
@@ -4411,6 +4489,7 @@ def analyse_oil_well(df: "pd.DataFrame | OilProductionData",
                wp_to_date_stb=float(data.Wp[-1]),
                t_start_days=float(data.t[-1]), t_max_years=t_max_years,
                n_ooip_stb=n_cap, m_gas_cap=m_used, we_to_date_rb=we_to_date,
+               n_pressure_stb=n_press,
                water_cut_econ=water_cut_econ,
                q_water_econ_stbd=q_water_econ_stbd,
                p_abandon_psia=p_abandon_psia)
@@ -4443,6 +4522,10 @@ def analyse_oil_well(df: "pd.DataFrame | OilProductionData",
         "water rate limit": (f"{q_water_econ_stbd:,.0f} STB/d"
                              if q_water_econ_stbd else "none"),
         "abandonment pressure": (f"{p_abandon_psia:,.0f} psia"
+                                 + (" (NOT APPLIED - see FORECAST)"
+                                    if "abandonment pressure"
+                                    in forecast.constraints_not_applied
+                                    else "")
                                  if p_abandon_psia else "none"),
         "forecast horizon": f"{t_max_years:,.0f} yr from the last record",
         "material balance": ("on" if use_material_balance else "off"),
@@ -4888,6 +4971,16 @@ def run_self_tests(verbose: bool = True) -> bool:
     check("the bubble-point break is found on a well that crossed it",
           gd.broke, f"break at Np={0.0 if not gd.broke else gd.break_np_stb / 1e6:,.1f} MMstb")
     check("the GOR peak is reported once the GOR turns over", gd.peaked)
+    # A reservoir saturated at discovery has no bubble point to cross: the
+    # field report said "the reservoir crossing its bubble point" under a PVT
+    # section that read "SATURATED at discovery".
+    gd_sat = gor_diagnostic(g, npc, pvt.rsi, saturated=True)
+    check("a GOR break on a saturated reservoir is not called the bubble "
+          "point", gd_sat.broke
+          and "crossing its bubble point" not in gd_sat.summary()
+          and "critical saturation" in gd_sat.summary())
+    check("an undersaturated reservoir still reports the bubble point",
+          "crossing its bubble point" in gd.summary())
 
     d2 = make_synthetic_oil_well(pvt, water_mechanism="none", seed=11,
                                  noise_frac=0.05, we_total_rb=42.0e6,
@@ -5020,6 +5113,27 @@ def run_self_tests(verbose: bool = True) -> bool:
           no_limit.abandonment_reason == "max forecast life")
     check("an EUR set by the horizon rather than the reservoir says so",
           "THE HORIZON SET THIS EUR" in no_limit.summary())
+
+    # An abandonment pressure with no N to turn production into pressure
+    # cannot be applied. The field report dropped it without a word and
+    # listed "abandonment pressure: 1,000 psia" in its settings.
+    pa_none = forecast_oil(bf, gm, wm, pvt, 150.0,
+                           **{**base, "p_abandon_psia": 1000.0})
+    check("an abandonment pressure that cannot be applied says so",
+          "abandonment pressure" in pa_none.constraints_not_applied
+          and "NOT APPLIED" in pa_none.summary())
+    # With the oil-in-place cap off, a fitted N must still drive the
+    # pressure limit - the cap and the pressure are different jobs.
+    pa_n = forecast_oil(bf, gm, wm, pvt, 150.0,
+                        **{**base, "p_abandon_psia": 1000.0,
+                           "n_pressure_stb": 50.0e6})
+    check("a fitted N applies the pressure limit with the cap off",
+          "reservoir pressure" in pa_n.constraint_years
+          and not pa_n.constraints_not_applied
+          and np.isfinite(pa_n.p_implied_end_psia),
+          f"{pa_n.constraint_years}")
+    check("the pressure N does not become an oil-in-place cap",
+          "oil in place" not in pa_n.constraint_years)
 
     tight = forecast_oil(bf, gm, wm, pvt, 150.0,
                          **{**base, "water_cut_econ": 0.01})
