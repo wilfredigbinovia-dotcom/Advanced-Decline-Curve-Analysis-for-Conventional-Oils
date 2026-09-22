@@ -939,6 +939,7 @@ def material_balance_oil(pressure: np.ndarray,
                          p_initial: Optional[float] = None,
                          p_initial_estimated: bool = False,
                          skip_early: int = 0,
+                         p_initial_label: Optional[str] = None,
                          min_depletion_psi: float = 50.0
                          ) -> MaterialBalanceOil:
     """Fit N (and optionally m) to the Havlena-Odeh straight line.
@@ -979,7 +980,8 @@ def material_balance_oil(pressure: np.ndarray,
     # that 7 % error as a number the user had supplied.
     if p_initial is not None:
         pi = float(p_initial)
-        pi_src = ("ESTIMATED by this tool, not measured"
+        pi_src = (p_initial_label if p_initial_label else
+                  "ESTIMATED by this tool, not measured"
                   if p_initial_estimated else "as entered")
     else:
         pi = float(np.max(p))
@@ -1265,8 +1267,12 @@ def material_balance_oil(pressure: np.ndarray,
                 "number every time, so volume is\n                      "
                 "arriving from outside the bracket: water influx, or a gas "
                 "cap larger than the m\n                      used. The "
-                "fitted N absorbs it and will be too large - the We >= 0 "
-                "ceiling\n                      is the number to hold to.")
+                "fitted N absorbs it and will be too large - "
+                + ("and the ceiling\n                      is too loose to "
+                   "stand in for it (see the NOTE). N is not determined."
+                   if uninformative_ceiling else
+                   "the We >= 0 ceiling\n                      is the number "
+                   "to hold to."))
 
     we = float("nan")
     if np.isfinite(n_hat) and use.any():
@@ -1314,6 +1320,8 @@ class OilQCReport:
     # The plateau end came from the 75 % guard rail, not from the data: the
     # smoothed rate had not fallen to 92 % of its peak by then (or at all).
     plateau_capped: bool = False
+    bdf_capped: bool = False
+    bdf_uncapped_days: Optional[float] = None
     plateau_uncapped_days: Optional[float] = None
     bdf_start_days: Optional[float] = None
     fit_start_days: Optional[float] = None
@@ -1368,7 +1376,19 @@ class OilQCReport:
         if self.bdf_start_days is not None:
             lines.append(f"  BDF start estimate      : day "
                          f"{self.bdf_start_days:.0f} "
-                         f"({self.bdf_start_days / DAYS_PER_YEAR:.2f} yr)")
+                         f"({self.bdf_start_days / DAYS_PER_YEAR:.2f} yr)"
+                         + ("   <-- NO CLEAN START FOUND"
+                            if self.bdf_capped else ""))
+            if self.bdf_capped:
+                lines.append(
+                    "                            no start inside the first "
+                    "40 % of the record gives a straight 1/D\n"
+                    "                            trend, so this is the least-"
+                    "bad one inside that limit. Searching\n"
+                    "                            the whole record would put "
+                    f"it at day {self.bdf_uncapped_days:,.0f}, and leave "
+                    "less to fit.\n                            Look at the "
+                    "rate plot and set the fit window yourself.")
         if self.fit_start_days is not None:
             lines.append(f"  decline fit starts      : day "
                          f"{self.fit_start_days:.0f} "
@@ -1703,6 +1723,20 @@ class OilProductionData:
             b_idx, b_t = (detect_bdf_start(obj.t[mask], obj.q_oil[mask])
                           if mask.sum() >= 12 else (None, None))
             qc.bdf_start_days = b_t
+            # Say when the BDF start is the best of a bad lot. The 1/D test
+            # looks for a start inside the first 40 % of the record; where
+            # none passes, it returns the least-bad one inside that limit.
+            # A field record reported "BDF start estimate: day 5,663" in the
+            # same voice as a detected one.
+            if b_t is not None and mask.sum() >= 12:
+                try:
+                    _, b_free = gdca.detect_bdf_start(
+                        obj.t[mask], obj.q_oil[mask], max_discard_frac=0.95)
+                    if b_free is not None and b_free > b_t + 1.0:
+                        qc.bdf_capped = True
+                        qc.bdf_uncapped_days = float(b_free)
+                except (ValueError, IndexError):
+                    pass
             starts = [v for v in (p_t, b_t) if v is not None]
             qc.fit_start_days = max(starts) if starts else None
             if qc.fit_start_days is not None:
@@ -2120,6 +2154,7 @@ def aquifer_history_match(t_days: np.ndarray, np_stb: np.ndarray,
                           aq_ro_ft: Optional[float] = None,
                           aq_mu_w_cp: float = 0.5,
                           min_dof: int = AQ_MIN_DOF,
+                          p_initial_label: Optional[str] = None,
                           profile_points: int = 15) -> AquiferMatch:
     """Regress N (and m) and an aquifer on the survey pressures.
 
@@ -2137,8 +2172,9 @@ def aquifer_history_match(t_days: np.ndarray, np_stb: np.ndarray,
     pi = float(p_initial) if p_initial is not None else float(pvt.p_init)
     out = AquiferMatch(kind=kind, fit_m=bool(fit_m), m=float(m_gas_cap or 0.0),
                        p_initial=pi,
-                       p_initial_source=("as entered" if p_initial is not None
-                                         else "the PVT initial pressure"))
+                       p_initial_source=(p_initial_label or (
+                           "as entered" if p_initial is not None
+                           else "from the PVT initial pressure")))
     ts = np.asarray(t_survey, float)
     ps = np.asarray(p_survey, float)
     npv = np.asarray(np_stb, float)
@@ -2464,6 +2500,23 @@ def aquifer_history_match(t_days: np.ndarray, np_stb: np.ndarray,
                      "translate U and t_c into h x theta and k")
     out.rock_note = "; ".join(notes)
     return out
+
+
+def _mb_unusable_reason(matbal: Optional["MaterialBalanceOil"]) -> str:
+    """Why a Havlena-Odeh N must not steer the forecast, or '' if it may."""
+    if matbal is None or not matbal.trend_ok:
+        return ""
+    if np.isfinite(matbal.r2) and matbal.r2 < 0:
+        return "its R2 is below zero"
+    # A loose ceiling alone is not disqualifying - a large closed reservoir
+    # early in life has one too, and its N is still read straight off the
+    # line. It is when the ceiling is loose AND the sequence says volume is
+    # arriving from outside that nothing is left to bound N.
+    if (matbal.n_uninformative_ceiling
+            and not str(matbal.drive).startswith("volumetric (depletion)")):
+        return ("its ceiling is over 50x the oil produced and the drive is "
+                "not volumetric")
+    return ""
 
 
 def _mh_dmin_inactive(fit) -> bool:
@@ -3392,6 +3445,12 @@ class RatioModel:
     # Residual sum of squares in LOG space, and the fitted points, so every
     # shape can be scored against the others on one scale.
     log_rss: float = float("nan")
+    # R2 in the space the shape was FITTED in, which is the space its p-value
+    # belongs to. `r2` above is on the log ratio, the common scale every
+    # shape is ranked on. For a linear WOR the two differ, and the field
+    # report printed "R2 -0.03, p 8.9e-12" - a fit worse than a flat line
+    # and highly significant, from two different spaces on one line.
+    r2_fit: float = float("nan")
     fit_np_stb: Optional[np.ndarray] = None
     fit_ratio: Optional[np.ndarray] = None
 
@@ -3475,15 +3534,26 @@ class RatioModel:
                         initial_indent=" " * 22,
                         subsequent_indent=" " * 22) if self.note else ""))
         if self.kind == "constant":
+            v0 = math.exp(self.ln_r0)
             return (f"  {self.label} model        : held constant at "
-                    f"{math.exp(self.ln_r0):,.3g}"
+                    + (f"{v0:,.0f}" if v0 >= 100 else f"{v0:,.3g}")
                     + ("\n" + textwrap.fill(
                         self.note, width=100,
                         initial_indent=" " * 22,
                         subsequent_indent=" " * 22) if self.note else ""))
+        same = (not np.isfinite(self.r2_fit)
+                or abs(self.r2_fit - self.r2) < 0.005)
+        r2_show = self.r2 if same else self.r2_fit
+        extra = ("" if same else
+                 f"\n                      R2 and p are in the {self.kind} "
+                 f"space it was fitted in; on log {self.label}, where the "
+                 f"shapes are\n                      ranked, its R2 is "
+                 f"{self.r2:.2f}"
+                 + (" - worse than a flat line." if self.r2 < 0 else "."))
         return (f"  {self.label} model        : {self.kind}, "
                 f"{self.pct_per_mmstb:+,.0f} % per MMstb of oil "
-                f"(R2 {self.r2:.2f}, p {self.p_value:.1e}, n={self.n_points})"
+                f"(R2 {r2_show:.2f}, p {self.p_value:.1e}, n={self.n_points})"
+                + extra
                 + ("\n" + textwrap.fill(self.note, width=100,
                                         initial_indent=" " * 22,
                                         subsequent_indent=" " * 22)
@@ -3595,6 +3665,7 @@ def _fit_one_shape(x: np.ndarray, r: np.ndarray, kind: str, label: str,
     m = replace(
         m,
         r2=(1.0 - rss / ss_tot if ss_tot > 0 else float("nan")),
+        r2_fit=float(getattr(lr, "rvalue", float("nan")) ** 2),
         p_value=float(getattr(lr, "pvalue", float("nan"))),
         stderr_intercept=float(math.sqrt(max(rss / max(n - 2, 1), 0.0)
                                          / max(n, 1))),
@@ -5328,6 +5399,22 @@ def analyse_oil_well(df: "pd.DataFrame | OilProductionData",
     n_cap = n_hard_max = None
     m_used = float(mb_m_gas_cap or 0.0)
     we_to_date = 0.0
+    # With no p_i given for the balance, the PVT's initial pressure is used -
+    # it is also an entered number, and the aquifer match already used it.
+    # The balance used to fall back on the highest survey instead and call
+    # it "NOT an entered p_i" on a field whose PVT said 3,493 psia, with the
+    # two methods on the same page starting from different pressures.
+    if mb_p_initial is not None:
+        pi_mb, pi_mb_label = float(mb_p_initial), None
+    else:
+        pi_mb = float(pvt.p_init)
+        pi_mb_label = "from the PVT initial pressure"
+        sv0 = data.surveys
+        if len(sv0):
+            p_hi = float(np.nanmax(sv0["p_res"].to_numpy(float)))
+            if p_hi > 1.01 * pi_mb:
+                pi_mb_label += (f" - a survey reads {p_hi:,.0f} psia, "
+                                "HIGHER; check both")
     if use_material_balance:
         sv = data.surveys
         if len(sv) >= 3:
@@ -5337,11 +5424,20 @@ def analyse_oil_well(df: "pd.DataFrame | OilProductionData",
                     sv["Gp_scf"].to_numpy(float),
                     (sv["Wp_stb"].to_numpy(float) if "Wp_stb" in sv else None),
                     pvt, m_gas_cap=mb_m_gas_cap, fit_gas_cap=mb_fit_gas_cap,
-                    p_initial=mb_p_initial, skip_early=mb_skip_early)
+                    p_initial=pi_mb, p_initial_label=pi_mb_label,
+                    skip_early=mb_skip_early)
             except Exception as exc:
                 warnings.warn(f"[{well}] material balance failed: {exc}")
     n_press = None
-    if matbal is not None and matbal.trend_ok and np.isfinite(matbal.n_ooip_stb):
+    # A balance whose N is not a number about the reservoir must not steer
+    # the forecast. The field report printed R2 -1,199 and "the ceiling
+    # constrains nothing", and then used that ceiling, 537 MMstb, as the
+    # oil-in-place cap, the N for the pressure path (3,231 psia at the end,
+    # so the 1,000 psia limit was "never" reached) and the denominator of a
+    # 1.8 % recovery factor.
+    mb_unusable = _mb_unusable_reason(matbal)
+    if (matbal is not None and matbal.trend_ok
+            and np.isfinite(matbal.n_ooip_stb) and not mb_unusable):
         m_used = float(matbal.m_gas_cap)
         # With the oil-in-place cap off, the fitted N (at the m it was fitted
         # with) still turns production into pressure for the abandonment
@@ -5416,7 +5512,8 @@ def analyse_oil_well(df: "pd.DataFrame | OilProductionData",
                 sv["t"].to_numpy(float) if len(sv) else np.array([]),
                 sv["p_res"].to_numpy(float) if len(sv) else np.array([]),
                 pvt, kind=kind_aq, m_gas_cap=float(mb_m_gas_cap or 0.0),
-                fit_m=bool(mb_fit_gas_cap), p_initial=mb_p_initial,
+                fit_m=bool(mb_fit_gas_cap), p_initial=pi_mb,
+                p_initial_label=pi_mb_label,
                 n_guess_stb=n_guess, aq_porosity=aq_porosity,
                 aq_ro_ft=aq_ro_ft, aq_mu_w_cp=aq_mu_w_cp)
         except (ValueError, ArithmeticError, np.linalg.LinAlgError) as exc:
@@ -5580,7 +5677,11 @@ def analyse_oil_well(df: "pd.DataFrame | OilProductionData",
                                "value used in its place)")
                          if mb_fit_gas_cap else "(supplied)")),
         "oil-in-place cap": (f"{n_cap / 1e6:,.1f} MMstb"
-                             if n_cap else "not applied"),
+                             if n_cap else
+                             f"not applied - the balance did not determine "
+                             f"N ({mb_unusable})"
+                             if mb_unusable and not aq_used
+                             else "not applied"),
         "N hard ceiling": (f"{n_hard_max / 1e6:,.1f} MMstb = min(F/Et)"
                            if n_hard_max else "none"),
         "Monte Carlo": (f"{n_mc:,} draws, seed {seed}"
@@ -6109,6 +6210,47 @@ def run_self_tests(verbose: bool = True) -> bool:
           not pd_ok.qc.plateau_capped
           and "GUARD RAIL" not in pd_ok.qc.summary(),
           f"plateau end day {pd_ok.qc.plateau_end_days}")
+
+    # -- 2b'. the fifth field report ---------------------------------------
+    mb_bad = MaterialBalanceOil(n_ooip_stb=7.1e8, r2=-1199.0, n_surveys=6,
+                                p_initial=3493.0, n_ceiling_stb=5.4e8,
+                                n_uninformative_ceiling=True,
+                                drive="NOT volumetric - influx or a larger "
+                                      "gas cap")
+    check("an N with R2 below zero does not steer the forecast",
+          _mb_unusable_reason(mb_bad) != "")
+    mb_loose = MaterialBalanceOil(n_ooip_stb=2.0e9, r2=0.99, n_surveys=6,
+                                  p_initial=3493.0,
+                                  n_uninformative_ceiling=True,
+                                  drive="NOT volumetric - influx or a larger "
+                                        "gas cap")
+    check("a loose ceiling on a non-volumetric balance does not either",
+          _mb_unusable_reason(mb_loose) != "")
+    mb_big_ok = replace(mb_loose, drive="volumetric (depletion)")
+    check("a large closed reservoir early in life keeps its N",
+          _mb_unusable_reason(mb_big_ok) == "")
+    rm_lin = RatioModel(kind="linear", label="WOR", ln_r0=math.log(2.7),
+                        slope_per_stb=1e-7, np_ref_stb=8.7e6, r2=-0.03,
+                        r2_fit=0.21, p_value=8.9e-12, n_points=204)
+    sm_lin = rm_lin.summary()
+    check("a ratio model's R2 and p come from the same space",
+          "R2 0.21, p 8.9e-12" in sm_lin and "worse than a flat line" in sm_lin
+          and "R2 -0.03, p" not in sm_lin)
+    rm_k = RatioModel(kind="constant", label="GOR", ln_r0=math.log(1333.0),
+                      slope_per_stb=0.0, np_ref_stb=0.0)
+    check("a held-constant ratio prints as a number, not 1.33e+03",
+          "held constant at 1,333" in rm_k.summary())
+    rng_b = np.random.default_rng(0)
+    tb_ = np.arange(300)
+    qb = np.where(tb_ < 200, 1000.0 * np.exp(-0.001 * tb_)
+                  * (1.0 + 0.25 * rng_b.standard_normal(300)),
+                  800.0 * np.exp(-0.03 * (tb_ - 200)))
+    qb = np.abs(qb) + 5.0
+    pd_b = OilProductionData.prepare(pd.DataFrame({
+        "date": pd.date_range("1980-01-01", periods=300, freq="MS"),
+        "q_oil": qb, "q_gas": qb * 0.5}), pvt, well="BDF")
+    check("a BDF start chosen for want of a clean one says so",
+          pd_b.qc.bdf_capped and "NO CLEAN START" in pd_b.qc.summary())
 
     # -- 2c. aquifer history match ----------------------------------------
     td_chk = np.array([0.01, 0.1, 1.0, 10.0, 100.0])

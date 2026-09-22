@@ -808,7 +808,7 @@ speak for itself.
 
 #### Verification
 
-174 self-tests, run with `python oil_dca.py`. They cover PVT shape and
+180 self-tests, run with `python oil_dca.py`. They cover PVT shape and
 continuity, N and m recovery on tanks marched from a known answer (exact at
 m = 0.00, 0.25, 0.60 and 1.20), the water-drive refusal, the balance inverted
 against the pressure that produced it, all four Chan mechanisms, the GOR break
