@@ -627,8 +627,11 @@ def chart_havlena_odeh(res, theme: str = "light",
         xs = np.linspace(0.0, float(np.nanmax(et)) * 1.05, 50)
         fig.add_trace(go.Scatter(
             x=xs, y=mb.n_ooip_stb * xs / 1.0e6, mode="lines",
-            name=f"N = {mb.n_ooip_mstb / 1e3:,.1f} MMstb",
-            line=dict(width=2.4, color=c["series"][1]),
+            name=(f"N = {mb.n_ooip_mstb / 1e3:,.1f} MMstb"
+                  if mb.n_determined else
+                  "line through origin - N NOT determined"),
+            line=(dict(width=2.4, color=c["series"][1]) if mb.n_determined
+                  else dict(width=1.4, color=c["muted"], dash="dash")),
             hoverinfo="skip"))
     if np.isfinite(mb.n_ceiling_stb) and len(et):
         xs = np.linspace(0.0, float(np.nanmax(et)) * 1.05, 50)
@@ -684,11 +687,16 @@ def chart_apparent_n(res, theme: str = "light", height: int = 380) -> go.Figure:
         hovertemplate=("Np %{x:,.2f} MMstb<br>p %{customdata:,.0f} psia<br>"
                        "F/Et %{y:,.1f} MMstb<extra></extra>")))
     if np.isfinite(mb.n_ooip_stb):
+        det = mb.n_determined
+        col = c["series"][1] if det else c["muted"]
         fig.add_hline(y=mb.n_ooip_stb / 1.0e6,
-                      line=dict(color=c["series"][1], width=2.0),
-                      annotation_text=f"fitted N "
-                                      f"{mb.n_ooip_stb / 1e6:,.1f} MMstb",
-                      annotation_font=dict(size=10, color=c["series"][1]))
+                      line=dict(color=col, width=2.0 if det else 1.2,
+                                dash=None if det else "dash"),
+                      annotation_text=(f"fitted N "
+                                       f"{mb.n_ooip_stb / 1e6:,.1f} MMstb"
+                                       if det else "line fit - N NOT "
+                                       "determined"),
+                      annotation_font=dict(size=10, color=col))
     if np.isfinite(mb.n_ceiling_stb):
         fig.add_hline(y=mb.n_ceiling_stb / 1.0e6,
                       line=dict(color=c["critical"], width=1.4, dash="dot"),

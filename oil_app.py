@@ -216,7 +216,7 @@ def run_analysis(df: pd.DataFrame, pvt_sig: tuple, settings: tuple,
             "ended_by": r.forecast.abandonment_reason,
             "recovery_factor": r.forecast.recovery_factor,
             "water_cut_end": r.forecast.water_cut_end,
-            "N_Mstb": (mb.n_ooip_mstb if mb and mb.trend_ok else np.nan),
+            "N_Mstb": (mb.n_ooip_mstb if mb and mb.n_determined else np.nan),
             "N_ceiling_Mstb": (mb.n_ceiling_stb / od.STB_PER_MSTB
                                if mb and mb.trend_ok else np.nan),
             "drive": (mb.drive if mb and mb.trend_ok else "not run"),
@@ -808,7 +808,7 @@ speak for itself.
 
 #### Verification
 
-180 self-tests, run with `python oil_dca.py`. They cover PVT shape and
+181 self-tests, run with `python oil_dca.py`. They cover PVT shape and
 continuity, N and m recovery on tanks marched from a known answer (exact at
 m = 0.00, 0.25, 0.60 and 1.20), the water-drive refusal, the balance inverted
 against the pressure that produced it, all four Chan mechanisms, the GOR break

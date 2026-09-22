@@ -693,6 +693,12 @@ class MaterialBalanceOil:
     m_fit_why_not: str = ""
     n_uninformative_ceiling: bool = False
     depletion_note: str = ""
+
+    @property
+    def n_determined(self) -> bool:
+        """A finite N that the balance can stand behind."""
+        return bool(self.trend_ok and np.isfinite(self.n_ooip_stb)
+                    and self.n_ooip_stb > 0 and not _mb_unusable_reason(self))
     r2: float = float("nan")
     n_surveys: int = 0
     n_skipped: int = 0
@@ -756,7 +762,16 @@ class MaterialBalanceOil:
         if not self.trend_ok:
             lines.append(f"  NOTE              : {self.note}")
             return "\n".join(lines)
+        why_not = _mb_unusable_reason(self)
         lines += [
+            # A slope the report itself calls meaningless is not quoted as
+            # oil in place. The field report printed "OOIP (N): 2,180,541
+            # Mstb +/- 509,984" and, twenty lines down, "N is not determined".
+            (f"  OOIP (N)          : NOT DETERMINED - {why_not}.\n"
+             f"                      The line through the origin reads "
+             f"{self.n_ooip_mstb:,.0f} Mstb; that is arithmetic,\n"
+             "                      not oil in place.")
+            if np.isfinite(self.n_ooip_stb) and why_not else
             (f"  OOIP (N)          : {self.n_ooip_mstb:,.0f} Mstb"
              + (f" +/- {self.n_stderr_stb / STB_PER_MSTB:,.0f}"
                 if np.isfinite(self.n_stderr_stb) else ""))
@@ -770,9 +785,9 @@ class MaterialBalanceOil:
              # to +/- 23 %.
              f"  R2                : {self.r2:.1f}  - BELOW ZERO: a flat line "
              "fits F better than N x Et does.\n                      F and "
-             "Et are not proportional on these surveys, so the N above is "
-             "not a\n                      slope the data support - see the "
-             "drive note."
+             "Et are not proportional on these surveys, so no N is a "
+             "slope\n                      the data support - see the drive "
+             "note."
              if np.isfinite(self.r2) else "  R2                : -"),
             (f"  gas cap m         : NOT DETERMINED - fit requested, but\n"
              f"                      {self.m_fit_why_not};\n"
@@ -836,7 +851,7 @@ class MaterialBalanceOil:
                     "spread, not the slope,\n                      because "
                     "influx makes the sequence rise then fall rather than "
                     "trend")
-        if self.exceeds_ceiling:
+        if self.exceeds_ceiling and not why_not:
             lines.append(
                 f"  WARNING           : the fitted N is "
                 f"{self.n_ooip_stb / self.n_ceiling_stb:.2f}x the We >= 0 "
@@ -866,7 +881,8 @@ class MaterialBalanceOil:
                 "volume fits\n                      equally well, so prefer "
                 "an m from structure and logs where you have one."
                 + loc)
-        if np.isfinite(self.we_implied_rb) and self.we_implied_rb > 0:
+        if (np.isfinite(self.we_implied_rb) and self.we_implied_rb > 0
+                and not why_not):
             lines.append(
                 f"  We implied        : {self.we_implied_rb / 1.0e6:,.2f} MMrb "
                 "to date at the fitted N")
@@ -3546,9 +3562,9 @@ class RatioModel:
         r2_show = self.r2 if same else self.r2_fit
         extra = ("" if same else
                  f"\n                      R2 and p are in the {self.kind} "
-                 f"space it was fitted in; on log {self.label}, where the "
-                 f"shapes are\n                      ranked, its R2 is "
-                 f"{self.r2:.2f}"
+                 f"space it was fitted in; on log {self.label},\n"
+                 f"                      where the shapes are ranked, its R2 "
+                 f"is {self.r2:.2f}"
                  + (" - worse than a flat line." if self.r2 < 0 else "."))
         return (f"  {self.label} model        : {self.kind}, "
                 f"{self.pct_per_mmstb:+,.0f} % per MMstb of oil "
@@ -6219,6 +6235,13 @@ def run_self_tests(verbose: bool = True) -> bool:
                                       "gas cap")
     check("an N with R2 below zero does not steer the forecast",
           _mb_unusable_reason(mb_bad) != "")
+    mb_bad2 = replace(mb_bad, we_implied_rb=8.4e5)
+    sm_bad = mb_bad2.summary()
+    check("an undetermined N is not quoted as oil in place",
+          "OOIP (N)          : NOT DETERMINED" in sm_bad
+          and "+/-" not in sm_bad.split("OOIP (N)")[1].split("\n")[0]
+          and "We implied" not in sm_bad and "the fitted N is" not in sm_bad
+          and not mb_bad2.n_determined)
     mb_loose = MaterialBalanceOil(n_ooip_stb=2.0e9, r2=0.99, n_surveys=6,
                                   p_initial=3493.0,
                                   n_uninformative_ceiling=True,
