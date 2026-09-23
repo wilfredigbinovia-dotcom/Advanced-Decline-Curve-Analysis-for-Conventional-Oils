@@ -5202,6 +5202,11 @@ class OilWellResult:
     water_diag: Optional[WaterCutDiagnostic] = None
     pi_diag: Optional[OilPIDiagnostic] = None
     matbal: Optional[MaterialBalanceOil] = None
+    # Where the analysis belongs. The well name is the group key; the field
+    # and reservoir are carried so a report read six months later says which
+    # reservoir it was about.
+    field_name: str = ""
+    reservoir_name: str = ""
     aquifer_match: Optional["AquiferMatch"] = None
     aquifer_used: bool = False
     aquifer_note: str = ""
@@ -5277,11 +5282,33 @@ class OilWellResult:
             pass
         return "\n".join(lines)
 
+    @property
+    def where_line(self) -> str:
+        """field / reservoir, for the report header and the chart titles."""
+        bits = []
+        if str(self.field_name).strip():
+            bits.append(f"field: {str(self.field_name).strip()}")
+        if str(self.reservoir_name).strip():
+            bits.append(f"reservoir: {str(self.reservoir_name).strip()}")
+        return "   ".join(bits)
+
+    @property
+    def label(self) -> str:
+        """Well, with the field and reservoir in brackets where they exist."""
+        bits = [str(b).strip() for b in (self.field_name,
+                                         self.reservoir_name)
+                if str(b).strip()]
+        return f"{self.well} ({', '.join(bits)})" if bits else str(self.well)
+
     def report(self) -> str:
         """The whole analysis as text, in the order a reader needs it."""
         w = self.well
         rule = "=" * 78
-        out = [rule, f"  OIL DECLINE-CURVE ANALYSIS -- {w}", rule, ""]
+        out = [rule, f"  OIL DECLINE-CURVE ANALYSIS -- {w}"]
+        where = self.where_line
+        if where:
+            out.append(f"  {where}")
+        out += [rule, ""]
 
         out.append("DATA AND QC")
         out.append(self.data.qc.summary())
@@ -5377,6 +5404,8 @@ def analyse_oil_well(df: "pd.DataFrame | OilProductionData",
                      b_prior: Optional[Tuple[float, float]] = None,
                      sample_model_form: bool = True,
                      prepare_kwargs: Optional[Dict] = None,
+                     field: str = "",
+                     reservoir: str = "",
                      seed: int = 11) -> OilWellResult:
     """Run the whole oil workflow on one well.
 
@@ -5721,7 +5750,8 @@ def analyse_oil_well(df: "pd.DataFrame | OilProductionData",
     }
 
     return OilWellResult(
-        limits=limits,
+        limits=limits, field_name=str(field or ""),
+        reservoir_name=str(reservoir or ""),
         well=well, data=data, pvt=pvt, model_table=table, fits=fits,
         best_fit=best, gor_model=gor_model, wor_model=wor_model,
         forecast=forecast, gor_diag=gor_diag, water_diag=water_diag,
@@ -6747,6 +6777,20 @@ def run_self_tests(verbose: bool = True) -> bool:
           and abs(res.matbal.n_ooip_stb - 50.0e6) / 50.0e6 < 0.05,
           f"{res.matbal.n_ooip_stb / 1e6:,.2f} MMstb"
           if res.matbal is not None else "no balance")
+    res_named = analyse_oil_well(raw, pvt, well="A-12", q_econ_stbd=150.0,
+                                 field="Marimba", reservoir="D-4 sand",
+                                 run_monte_carlo=False, t_max_years=5.0)
+    head = res_named.report().splitlines()[1:3]
+    check("the report header carries the field and the reservoir",
+          "A-12" in head[0] and "field: Marimba" in head[1]
+          and "reservoir: D-4 sand" in head[1], " | ".join(head))
+    check("the chart label names the well, field and reservoir",
+          res_named.label == "A-12 (Marimba, D-4 sand)", res_named.label)
+    check("an unnamed analysis keeps the plain header",
+          res.report().splitlines()[1].strip()
+          == "OIL DECLINE-CURVE ANALYSIS -- SELFTEST"
+          and res.label == "SELFTEST" and res.where_line == "")
+
     check("the settings block records every choice that moved a number",
           all(k in res.settings for k in
               ("rate basis", "fit window", "model selected",

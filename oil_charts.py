@@ -65,6 +65,11 @@ def _dates(res) -> np.ndarray:
     return np.array([""] * len(d))
 
 
+def _who(res) -> str:
+    """The well, with its field and reservoir where they were given."""
+    return str(getattr(res, "label", None) or getattr(res, "well", ""))
+
+
 def _marker(colour: str, theme: str, size: float = 7.0,
             opacity: float = 1.0) -> dict:
     c = palette(theme)
@@ -242,7 +247,7 @@ def chart_rate_time(res, theme: str = "light", log_y: bool = True,
     q_econ = res.limits.get("q_econ_stbd", float("nan"))
     _limit_line(fig, q_econ, f"economic limit {q_econ:,.0f} STB/d", theme)
 
-    _layout(fig, theme, f"Oil rate: history, fit and forecast -- {res.well}",
+    _layout(fig, theme, f"Oil rate: history, fit and forecast -- {_who(res)}",
             "Time on production (years)", "Oil rate (STB/d)",
             log_y=log_y, height=height)
     if log_y:
@@ -311,7 +316,7 @@ def chart_stream(res, stream: str = "oil", theme: str = "light",
         if np.isfinite(lim) and lim > 0:
             _limit_line(fig, lim, f"handling limit {lim:,.0f} STB/d", theme)
 
-    fig = _layout(fig, theme, f"{spec['label']} -- {res.well}",
+    fig = _layout(fig, theme, f"{spec['label']} -- {_who(res)}",
                   "Time on production (years)",
                   f"{spec['label']} ({spec['unit']})",
                   log_y=True, height=height)
@@ -372,7 +377,7 @@ def chart_rate_cum(res, theme: str = "light", height: int = 400) -> go.Figure:
     _limit_line(fig, q_econ, f"economic limit {q_econ:,.0f} STB/d", theme)
 
     fig = _layout(fig, theme,
-                  f"Oil rate against cumulative -- {res.well}",
+                  f"Oil rate against cumulative -- {_who(res)}",
                   "Cumulative oil (MMstb)", "Oil rate (STB/d)",
                   log_y=True, height=height)
     _set_log_range(fig, [d.q_oil, tb["q_oil_stbd"].to_numpy(float)],
@@ -438,7 +443,7 @@ def chart_gor(res, theme: str = "light", height: int = 420) -> go.Figure:
                           annotation_text="GOR peak",
                           annotation_position="top right",
                           annotation_font=dict(size=10, color=c["series"][4]))
-    return _layout(fig, theme, f"Producing GOR -- {res.well}",
+    return _layout(fig, theme, f"Producing GOR -- {_who(res)}",
                    "Cumulative oil (MMstb)", "GOR (scf/STB)", height=height)
 
 
@@ -500,7 +505,7 @@ def chart_chan(res, theme: str = "light", height: int = 420) -> go.Figure:
                       annotation_position="top left",
                       annotation_font=dict(size=10, color=c["muted"]))
 
-    fig = _layout(fig, theme, f"Chan water diagnostic -- {res.well}",
+    fig = _layout(fig, theme, f"Chan water diagnostic -- {_who(res)}",
                   "Days since breakthrough", "WOR and WOR'",
                   log_y=True, height=height)
     _set_log_range(fig, [wor, dwor[pos]])
@@ -550,7 +555,7 @@ def chart_pi(res, theme: str = "light", height: int = 400) -> go.Figure:
             x=t_yr, y=anchor * np.exp(k * (t_yr - t_mid)), mode="lines",
             name=f"{pi.trend_pct_per_year:+.1f} %/yr",
             line=dict(width=2.4, color=c["series"][1])))
-    fig = _layout(fig, theme, f"Productivity index -- {res.well}",
+    fig = _layout(fig, theme, f"Productivity index -- {_who(res)}",
                   "Time on production (years)", "PI (STB/d/psi)",
                   height=height)
     fig.add_annotation(
@@ -596,7 +601,7 @@ def chart_water(res, theme: str = "light", height: int = 400) -> go.Figure:
     if np.isfinite(lim) and lim > 0:
         _limit_line(fig, 100.0 * lim, f"limit {100 * lim:.0f} %", theme,
                     position="top right")
-    fig = _layout(fig, theme, f"Water cut -- {res.well}",
+    fig = _layout(fig, theme, f"Water cut -- {_who(res)}",
                   "Time on production (years)", "Water cut (%)",
                   height=height)
     fig.update_layout(hovermode="x unified")
@@ -649,7 +654,7 @@ def chart_havlena_odeh(res, theme: str = "light",
                        "Np %{customdata[1]:,.2f} MMstb<br>"
                        "Et %{x:.5f} rb/STB<br>F %{y:,.2f} MMrb"
                        "<extra></extra>")))
-    return _layout(fig, theme, f"Havlena-Odeh -- {res.well}",
+    return _layout(fig, theme, f"Havlena-Odeh -- {_who(res)}",
                    "Et = Eo + m Eg + Efw (rb/STB)", "F (MMrb)", height=height)
 
 
@@ -703,7 +708,7 @@ def chart_apparent_n(res, theme: str = "light", height: int = 380) -> go.Figure:
                       annotation_text="ceiling, We >= 0",
                       annotation_position="bottom right",
                       annotation_font=dict(size=10, color=c["critical"]))
-    fig = _layout(fig, theme, f"Apparent oil in place -- {res.well}",
+    fig = _layout(fig, theme, f"Apparent oil in place -- {_who(res)}",
                   "Cumulative oil (MMstb)", "F / Et (MMstb)", height=height)
     if mb.drive:
         fig.add_annotation(
@@ -741,7 +746,7 @@ def chart_aquifer_match(res, theme: str = "light",
     ys = [am.p_sim, am.p_obs] + ([am.p_closed] if am.p_closed is not None
                                  else [])
     _set_linear_range(fig, [yrs, am.t_obs / 365.25], ys)
-    fig = _layout(fig, theme, f"Pressure history match -- {res.well}",
+    fig = _layout(fig, theme, f"Pressure history match -- {_who(res)}",
                   "Years on production", "Reservoir pressure (psia)",
                   height=height)
     fig.add_annotation(
@@ -783,7 +788,7 @@ def chart_aquifer_profile(res, theme: str = "light",
                       annotation_text="Havlena-Odeh N",
                       annotation_position="bottom right",
                       annotation_font=dict(size=10, color=c["muted"]))
-    fig = _layout(fig, theme, f"How well each N can be matched -- {res.well}",
+    fig = _layout(fig, theme, f"How well each N can be matched -- {_who(res)}",
                   "Oil in place N (MMstb)", "Pressure mismatch, RMS (psi)",
                   height=height)
     # An explicit log range. Left to autorange, the vrect and vline put the
@@ -864,7 +869,7 @@ def chart_eur_cdf(res, column: str = "eur_oil_mstb",
                       annotation_text=f"base case ({pctl:.0f}th)",
                       annotation_position="bottom right",
                       annotation_font=dict(size=10, color=c["critical"]))
-    return _layout(fig, theme, f"EUR exceedance -- {res.well}", label,
+    return _layout(fig, theme, f"EUR exceedance -- {_who(res)}", label,
                    "Chance of exceeding (%)", height=height)
 
 

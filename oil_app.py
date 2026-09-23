@@ -27,6 +27,7 @@ from __future__ import annotations
 import io
 import math
 import os
+import re
 import sys
 import traceback
 from typing import Dict, Optional, Tuple
@@ -165,12 +166,16 @@ def run_analysis(df: pd.DataFrame, pvt_sig: tuple, settings: tuple,
     """Analyse every well. Keyed on the frame, the PVT and the settings."""
     (q_econ, model, t_max, run_mc, n_mc, use_mb, fit_m, m_in, mb_pi, mb_skip,
      cap, wcut_lim, qw_lim, p_ab, rate_basis, min_uptime, outlier_sigma,
-     fit_from_bdf, window, sample_mf, aq_kind, aq_phi, aq_ro, aq_mu) = settings
+     fit_from_bdf, window, sample_mf, aq_kind, aq_phi, aq_ro, aq_mu,
+     field_name, reservoir_name, well_name) = settings
     pvt = build_pvt(*pvt_sig)
 
     raw = od.map_oil_columns(df)
+    # With no well column the whole file is one well, and it takes the name
+    # typed in the sidebar rather than the word FIELD.
     groups = ({str(k): v for k, v in raw.groupby(well_col)}
-              if well_col and well_col in raw.columns else {"FIELD": raw})
+              if well_col and well_col in raw.columns
+              else {(str(well_name).strip() or "WELL"): raw})
 
     results, errors = {}, {}
     for name, grp in groups.items():
@@ -194,7 +199,8 @@ def run_analysis(df: pd.DataFrame, pvt_sig: tuple, settings: tuple,
                 q_water_econ_stbd=(qw_lim if qw_lim > 0 else None),
                 p_abandon_psia=(p_ab if p_ab and p_ab > 0 else None),
                 fit_from_bdf=fit_from_bdf, fit_window_days=window,
-                sample_model_form=bool(sample_mf))
+                sample_model_form=bool(sample_mf),
+                field=field_name, reservoir=reservoir_name)
         except Exception as exc:
             errors[name] = f"{type(exc).__name__}: {exc}"
 
@@ -202,6 +208,8 @@ def run_analysis(df: pd.DataFrame, pvt_sig: tuple, settings: tuple,
     for name, r in results.items():
         mb = r.matbal
         row = {
+            "field": field_name,
+            "reservoir": reservoir_name,
             "well": name,
             "model": r.best_fit.model_name,
             "points_fitted": r.best_fit.n_points,
@@ -241,6 +249,17 @@ def run_analysis(df: pd.DataFrame, pvt_sig: tuple, settings: tuple,
 # ==============================================================================
 
 with st.sidebar:
+    st.markdown("### Names")
+    note("These ride on the report header, the chart titles and the summary "
+         "table, so a file read months later says what it was about.")
+    field_name = st.text_input("Field", "", key="field_name")
+    reservoir_name = st.text_input("Reservoir", "", key="reservoir_name")
+    well_name = st.text_input(
+        "Well", "", key="well_name",
+        help="Used when the data has no well column. With one, the names in "
+             "that column are used and this is ignored.")
+
+    st.markdown("---")
     st.markdown("### Fluid definition")
     note("Rs, Bo, Bt and Bg are built from these. The bubble point is derived "
          "from Rsi unless you set it, and everything downstream - the "
@@ -407,7 +426,8 @@ with st.sidebar:
 settings = (q_econ, model, float(t_max), run_mc, int(n_mc), use_mb, fit_m,
             m_in, mb_pi, mb_skip, cap, wcut_lim, qw_lim, p_ab, rate_basis,
             min_uptime, outlier_sigma, fit_from_bdf, window, bool(sample_mf),
-            aq_kind, float(aq_phi), float(aq_ro), float(aq_mu))
+            aq_kind, float(aq_phi), float(aq_ro), float(aq_mu),
+            field_name.strip(), reservoir_name.strip(), well_name.strip())
 
 # ==============================================================================
 # Intake
@@ -416,6 +436,8 @@ settings = (q_econ, model, float(t_max), run_mc, int(n_mc), use_mb, fit_m,
 st.title("Oil decline curve analysis")
 st.caption(f"oil_dca v{od.__version__} -- conventional oil, solution gas, "
            "gas cap and water drive")
+if field_name or reservoir_name:
+    st.caption(" -- ".join(x for x in (field_name, reservoir_name) if x))
 
 src = st.radio("Data source", ["Demo field", "Upload a file", "Paste a table"],
                horizontal=True)
@@ -642,19 +664,26 @@ with tabs[6]:
 
 # ---------------------------------------------------------------------- Export
 with tabs[7]:
+    # File names carry the field and reservoir too, so a folder of exports
+    # from several reservoirs does not turn into six files called
+    # FIELD_oil_report.txt.
+    stem = "_".join(re.sub(r"[^A-Za-z0-9._-]+", "-", str(x)).strip("-")
+                    for x in (field_name, reservoir_name, well) if str(x))
+    stem = stem or "oil"
     st.download_button("Report (.txt)", res.report(),
-                       file_name=f"{well}_oil_report.txt", mime="text/plain")
+                       file_name=f"{stem}_oil_report.txt", mime="text/plain")
     st.download_button("Forecast table (.csv)",
                        res.forecast.table.to_csv(index=False),
-                       file_name=f"{well}_oil_forecast.csv", mime="text/csv")
+                       file_name=f"{stem}_oil_forecast.csv", mime="text/csv")
     if summary is not None and len(summary):
         st.download_button("Field summary (.csv)",
                            summary.to_csv(index=False),
-                           file_name="oil_field_summary.csv", mime="text/csv")
+                           file_name=f"{stem}_oil_summary.csv",
+                           mime="text/csv")
     if res.mc is not None and len(res.mc):
         st.download_button("Monte Carlo realisations (.csv)",
                            res.mc.to_csv(index=False),
-                           file_name=f"{well}_oil_mc.csv", mime="text/csv")
+                           file_name=f"{stem}_oil_mc.csv", mime="text/csv")
     st.markdown("#### Report")
     mono(res.report())
 
@@ -808,7 +837,7 @@ speak for itself.
 
 #### Verification
 
-181 self-tests, run with `python oil_dca.py`. They cover PVT shape and
+184 self-tests, run with `python oil_dca.py`. They cover PVT shape and
 continuity, N and m recovery on tanks marched from a known answer (exact at
 m = 0.00, 0.25, 0.60 and 1.20), the water-drive refusal, the balance inverted
 against the pressure that produced it, all four Chan mechanisms, the GOR break
